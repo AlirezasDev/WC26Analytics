@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -47,10 +45,42 @@ ROLE_MAP = {
     "Centre-Forward": "forward",
     "Forward": "forward",
 }
+LEAKAGE_DIFF_SUFFIXES = {"game_id", "club_id", "club_goals"}
+LEAKAGE_FEATURE_COLUMNS = {
+    "home_game_id",
+    "away_game_id",
+    "home_date",
+    "away_date",
+    "home_club_goals",
+    "away_club_goals",
+    "diff_game_id",
+    "diff_club_id",
+    "diff_club_goals",
+}
+
+REQUIRED_CSV_FILES = [
+    "appearances.csv",
+    "club_games.csv",
+    "clubs.csv",
+    "competitions.csv",
+    "countries.csv",
+    "game_events.csv",
+    "game_lineups.csv",
+    "games.csv",
+    "national_teams.csv",
+    "player_valuations.csv",
+    "players.csv",
+    "transfers.csv",
+]
+
+
+class InputError(ValueError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="train a WC26 RandomForest model")
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "predict"], help="Mode: train a new model or predict using saved model")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parents[1] / "artifacts")
     parser.add_argument("--test-fraction", type=float, default=0.2)
@@ -60,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--competition-scope",
         type=str,
-        default="national_team_competition",
+        default="all",
         choices=["national_team_competition", "all"],
         help="Filter matches to a scope before feature engineering",
     )
@@ -73,11 +103,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-away-starting", type=str, default=None)
     parser.add_argument("--predict-away-subs", type=str, default=None)
     parser.add_argument("--predict-as-of-date", type=str, default=None)
+    parser.add_argument("--neutral-site", action="store_true", help="Average both team orderings for a neutral venue prediction")
+    parser.add_argument("--prediction-csv", type=Path, default=None, help="Path to CSV file with batch predictions (9 columns: prediction_date, home_team, away_team, home_manager, away_manager, home_starting, home_subs, away_starting, away_subs)")
+    parser.add_argument("--simulation-runs", type=int, default=1, help="Number of simulation runs for CSV batch predictions")
     return parser.parse_args()
 
 
 def load_csv(data_dir: Path, name: str, parse_dates: list[str] | None = None) -> pd.DataFrame:
     return pd.read_csv(data_dir / name, low_memory=False, parse_dates=parse_dates)
+
+
+def validate_required_csv_files(data_dir: Path) -> None:
+    missing_files = [name for name in REQUIRED_CSV_FILES if not (data_dir / name).is_file()]
+    if missing_files:
+        raise InputError(f"Missing required input files in {data_dir}: {', '.join(sorted(missing_files))}")
 
 
 def to_datetime(series: pd.Series) -> pd.Series:
@@ -100,12 +139,44 @@ def parse_name_list(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_csv_name_list(value: str | None) -> list[str]:
+    """Parse names from CSV column - supports both comma and semicolon separators."""
+    if not value:
+        return []
+    # check if semicolon is used (preferred for CSV to avoid conflicts with commas in names)
+    if ";" in str(value):
+        return [item.strip() for item in str(value).split(";") if item.strip()]
+    # fall back to comma
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def safe_input(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError as exc:
+        raise InputError("Input stream closed before all required values were provided") from exc
+    except KeyboardInterrupt as exc:
+        raise InputError("Input cancelled by user") from exc
+
+
 def prompt_text(prompt: str, default: str | None = None) -> str | None:
     suffix = f" [{default}]" if default else ""
-    value = input(f"{prompt}{suffix}: ").strip()
+    value = safe_input(f"{prompt}{suffix}: ").strip()
     if value:
         return value
     return default
+
+
+def prompt_yes_no(prompt: str, default: str = "y") -> bool:
+    normalized_default = default.lower() if default else "y"
+    while True:
+        answer = prompt_text(prompt, normalized_default)
+        normalized = (answer or normalized_default).strip().lower()
+        if normalized in {"y", "yes", "1", "true", "t"}:
+            return True
+        if normalized in {"n", "no", "0", "false", "f"}:
+            return False
+        print("Please answer with y/n, yes/no, true/false, or 1/0.")
 
 
 def prompt_name_list(prompt: str, default: str | None = None) -> list[str]:
@@ -113,22 +184,212 @@ def prompt_name_list(prompt: str, default: str | None = None) -> list[str]:
     return parse_name_list(value)
 
 
-def prompt_interactive_inference() -> dict[str, object] | None:
-    answer = prompt_text("Run an inference example now? (y/n)", "y")
-    if not answer or answer.lower() not in {"y", "yes"}:
-        return None
+def prompt_required_team_name(prompt: str, team_dim: pd.DataFrame) -> str:
+    while True:
+        team_name = (prompt_text(prompt) or "").strip()
+        if not team_name:
+            print("Team name is required.")
+            continue
+        matches = find_team_matches(team_dim, team_name)
+        if matches.empty:
+            print(f"Unknown team: {team_name}")
+            continue
+        if len(matches) > 1:
+            print(f"Team name is ambiguous: {team_name}")
+            continue
+        return team_name
 
-    return {
-        "home_team_name": prompt_text("Home team name"),
-        "away_team_name": prompt_text("Away team name"),
-        "home_manager_name": prompt_text("Home manager name", "") or None,
-        "away_manager_name": prompt_text("Away manager name", "") or None,
-        "home_starting": prompt_name_list("Home starting lineup (comma-separated, optional)", ""),
-        "home_subs": prompt_name_list("Home substitutes (comma-separated, optional)", ""),
-        "away_starting": prompt_name_list("Away starting lineup (comma-separated, optional)", ""),
-        "away_subs": prompt_name_list("Away substitutes (comma-separated, optional)", ""),
-        "as_of_date_text": prompt_text("Prediction as-of date (YYYY-MM-DD, optional)", "") or None,
-    }
+
+def prompt_optional_date(prompt: str) -> str | None:
+    while True:
+        value = prompt_text(prompt, "")
+        if not value:
+            return None
+        parsed_value = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed_value):
+            print("Prediction as-of date must use a valid date format like YYYY-MM-DD.")
+            continue
+        return value
+
+
+def prompt_optional_manager_name(prompt: str) -> str | None:
+    value = prompt_text(prompt, "")
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def prompt_lineup(
+    prompt: str,
+    players: pd.DataFrame,
+    exact_items: int | None = None,
+    banned_names: list[str] | None = None,
+) -> list[str]:
+    banned_lookup = {normalize_name(name) for name in (banned_names or []) if normalize_name(name)}
+    while True:
+        values = normalize_name_list(prompt_name_list(prompt, ""))
+        if exact_items is not None and len(values) != exact_items:
+            print(f"This list must contain exactly {exact_items} players.")
+            continue
+
+        normalized_values = [normalize_name(value) for value in values]
+        duplicates = sorted({value for value in normalized_values if value and normalized_values.count(value) > 1})
+        if duplicates:
+            print(f"Duplicate player names are not allowed: {', '.join(duplicates)}")
+            continue
+
+        overlap = sorted({value for value in normalized_values if value in banned_lookup})
+        if overlap:
+            print(f"These players were already entered for this team: {', '.join(overlap)}")
+            continue
+
+        return values
+
+
+def normalize_name_list(values: list[str]) -> list[str]:
+    return [item.strip() for item in values if item and item.strip()]
+
+
+def find_team_matches(team_dim: pd.DataFrame, team_name: str) -> pd.DataFrame:
+    normalized = normalize_name(team_name)
+    return team_dim[team_dim["team_name"].fillna("").map(normalize_name).eq(normalized)]
+
+
+def validate_prediction_request(
+    request: dict[str, object],
+    team_dim: pd.DataFrame,
+    games: pd.DataFrame,
+) -> list[str]:
+    issues: list[str] = []
+
+    home_team_name = str(request.get("home_team_name") or "").strip()
+    away_team_name = str(request.get("away_team_name") or "").strip()
+    home_manager_name = request.get("home_manager_name")
+    away_manager_name = request.get("away_manager_name")
+    home_starting = normalize_name_list(list(request.get("home_starting") or []))
+    home_subs = normalize_name_list(list(request.get("home_subs") or []))
+    away_starting = normalize_name_list(list(request.get("away_starting") or []))
+    away_subs = normalize_name_list(list(request.get("away_subs") or []))
+    as_of_date_text = request.get("as_of_date_text")
+
+    if not home_team_name:
+        issues.append("Home team name is required.")
+    if not away_team_name:
+        issues.append("Away team name is required.")
+
+    if home_team_name and away_team_name and normalize_name(home_team_name) == normalize_name(away_team_name):
+        issues.append("Home and away teams must be different.")
+
+    if home_team_name:
+        home_matches = find_team_matches(team_dim, home_team_name)
+        if home_matches.empty:
+            issues.append(f"Unknown home team: {home_team_name}")
+        elif len(home_matches) > 1:
+            issues.append(f"Home team name is ambiguous: {home_team_name}")
+
+    if away_team_name:
+        away_matches = find_team_matches(team_dim, away_team_name)
+        if away_matches.empty:
+            issues.append(f"Unknown away team: {away_team_name}")
+        elif len(away_matches) > 1:
+            issues.append(f"Away team name is ambiguous: {away_team_name}")
+
+    if home_manager_name and away_manager_name and normalize_name(str(home_manager_name)) == normalize_name(str(away_manager_name)):
+        issues.append("Home and away managers must be different.")
+
+    if as_of_date_text:
+        parsed_date = pd.to_datetime(as_of_date_text, errors="coerce")
+        if pd.isna(parsed_date):
+            issues.append("Prediction as-of date must use a valid date format like YYYY-MM-DD.")
+    elif pd.Series(games["date"]).dropna().empty:
+        issues.append("No valid historical dates are available to infer the prediction date.")
+
+    def add_list_issues(label: str, values: list[str], exact_items: int | None = None) -> None:
+        if exact_items is not None and len(values) != exact_items:
+            issues.append(f"{label} must contain exactly {exact_items} players.")
+        normalized_values = [normalize_name(value) for value in values]
+        duplicates = sorted({value for value in normalized_values if value and normalized_values.count(value) > 1})
+        if duplicates:
+            issues.append(f"{label} contains duplicate player names: {', '.join(duplicates)}")
+
+    add_list_issues("Home starting lineup", home_starting, 11)
+    add_list_issues("Away starting lineup", away_starting, 11)
+    add_list_issues("Home substitutes", home_subs)
+    add_list_issues("Away substitutes", away_subs)
+
+    for label, values in [
+        ("Home lineup", home_starting + home_subs),
+        ("Away lineup", away_starting + away_subs),
+    ]:
+        normalized_values = [normalize_name(value) for value in values]
+        duplicates = sorted({value for value in normalized_values if value and normalized_values.count(value) > 1})
+        if duplicates:
+            issues.append(f"{label} reuses the same player in multiple roles: {', '.join(duplicates)}")
+
+    home_roster = {normalize_name(value) for value in home_starting + home_subs if normalize_name(value)}
+    away_roster = {normalize_name(value) for value in away_starting + away_subs if normalize_name(value)}
+    shared_players = sorted(home_roster & away_roster)
+    if shared_players:
+        issues.append(f"Team rosters must not overlap: {', '.join(shared_players)}")
+
+    return issues
+
+
+def prompt_interactive_inference(team_dim: pd.DataFrame, players: pd.DataFrame, games: pd.DataFrame) -> dict[str, object] | None:
+    if not prompt_yes_no("Run an inference example now? (y/n)", "y"):
+        return None
+    while True:
+        home_team_name = prompt_required_team_name("Home team name", team_dim)
+        away_team_name = prompt_required_team_name("Away team name", team_dim)
+        while normalize_name(home_team_name) == normalize_name(away_team_name):
+            print("Home and away teams must be different.")
+            away_team_name = prompt_required_team_name("Away team name", team_dim)
+
+        home_manager_name = prompt_optional_manager_name("Home manager name (optional)")
+        away_manager_name = prompt_optional_manager_name("Away manager name (optional)")
+        while home_manager_name and away_manager_name and normalize_name(home_manager_name) == normalize_name(away_manager_name):
+            print("Home and away managers must be different.")
+            away_manager_name = prompt_optional_manager_name("Away manager name (optional)")
+
+        as_of_date_text = prompt_optional_date("Prediction as-of date (YYYY-MM-DD, optional)")
+        neutral_site = prompt_yes_no("Neutral site? (y/n)", "y")
+
+        home_starting = prompt_lineup("Home starting lineup (comma-separated, required 11 players)", players, exact_items=11)
+        home_subs = prompt_lineup("Home substitutes (comma-separated, optional)", players, banned_names=home_starting)
+        home_roster = home_starting + home_subs
+        away_starting = prompt_lineup(
+            "Away starting lineup (comma-separated, required 11 players)",
+            players,
+            exact_items=11,
+            banned_names=home_roster,
+        )
+        away_subs = prompt_lineup(
+            "Away substitutes (comma-separated, optional)",
+            players,
+            banned_names=home_roster + away_starting,
+        )
+
+        request = {
+            "home_team_name": home_team_name,
+            "away_team_name": away_team_name,
+            "home_manager_name": home_manager_name,
+            "away_manager_name": away_manager_name,
+            "home_starting": home_starting,
+            "home_subs": home_subs,
+            "away_starting": away_starting,
+            "away_subs": away_subs,
+            "as_of_date_text": as_of_date_text,
+            "neutral_site": neutral_site,
+        }
+        issues = validate_prediction_request(request, team_dim, games)
+        if not issues:
+            return request
+
+        print("Input errors:")
+        for issue in issues:
+            print(f"- {issue}")
+        print("Please re-enter the prediction inputs.")
 
 
 def role_from_position(position: object) -> str:
@@ -281,7 +542,6 @@ def build_club_event_history(game_events: pd.DataFrame, games: pd.DataFrame) -> 
         group["club_event_matches_before"] = np.arange(len(group))
         group["club_goal_events_before"] = group["club_goal_events"].shift(1).fillna(0).cumsum()
         group["club_card_events_before"] = group["club_card_events"].shift(1).fillna(0).cumsum()
-        group["club_sub_events_before"] = group["club_sub_events"].shift(1).fillna(0).cumsum()
         group["club_goal_events_last_5"] = group["club_goal_events"].shift(1).rolling(5, min_periods=1).mean()
         group["club_card_events_last_5"] = group["club_card_events"].shift(1).rolling(5, min_periods=1).mean()
         group["club_sub_events_last_5"] = group["club_sub_events"].shift(1).rolling(5, min_periods=1).mean()
@@ -646,6 +906,8 @@ def build_diff_features(frame: pd.DataFrame) -> pd.DataFrame:
     for home_column in home_columns:
         suffix = home_column[len("home_"):]
         away_column = f"away_{suffix}"
+        if suffix in LEAKAGE_DIFF_SUFFIXES:
+            continue
         if away_column in pair.columns and pd.api.types.is_numeric_dtype(pair[home_column]) and pd.api.types.is_numeric_dtype(pair[away_column]):
             pair[f"diff_{suffix}"] = pair[home_column] - pair[away_column]
     return pair
@@ -661,10 +923,17 @@ def build_feature_matrix(pair: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, l
         "round",
         "home_club_id",
         "away_club_id",
+        "home_game_id",
+        "away_game_id",
+        "home_date",
+        "away_date",
         "home_club_goals",
         "away_club_goals",
-        "own_manager_name",
+        "diff_game_id",
+        "diff_club_id",
+        "diff_club_goals",
     ]
+    drop_columns.extend(sorted(LEAKAGE_FEATURE_COLUMNS))
     for column in drop_columns:
         if column in features.columns:
             features = features.drop(columns=column)
@@ -704,12 +973,15 @@ def build_model(numeric_columns: list[str], categorical_columns: list[str], n_es
         ]
     )
     classifier = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=None,
-        min_samples_leaf=4,
+        n_estimators=600,
+        max_depth=22,
+        min_samples_split=10,
+        min_samples_leaf=7,
+        max_features=None,
+        bootstrap=True,
+        class_weight="balanced_subsample",
         random_state=random_state,
         n_jobs=-1,
-        class_weight="balanced_subsample",
     )
     return Pipeline(steps=[("preprocess", preprocessor), ("classifier", classifier)])
 
@@ -721,7 +993,7 @@ def time_based_split(features: pd.DataFrame, y: pd.Series, dates: pd.Series, tes
     ordered = ordered.sort_values(["_date", "game_id"] if "game_id" in ordered.columns else ["_date"]).reset_index(drop=True)
     unique_dates = ordered["_date"].dropna().sort_values().unique()
     if len(unique_dates) == 0:
-        raise ValueError("No valid dates available for splitting")
+        raise InputError("No valid dates available for splitting")
     cutoff_index = max(0, int(len(unique_dates) * (1 - test_fraction)) - 1)
     cutoff_date = unique_dates[cutoff_index]
     train_mask = ordered["_date"] <= cutoff_date
@@ -739,26 +1011,12 @@ def time_based_split(features: pd.DataFrame, y: pd.Series, dates: pd.Series, tes
 
 def save_curves(output_dir: Path, y_true: pd.Series, y_proba: np.ndarray) -> None:
     y_true_bin = label_binarize(y_true, classes=[0, 1, 2])
-    class_indices = list(RESULT_LABELS.keys())
 
     plt.figure(figsize=(9, 7))
     for class_index, class_label in RESULT_LABELS.items():
         fpr, tpr, _ = roc_curve(y_true_bin[:, class_index], y_proba[:, class_index])
         auc_score = roc_auc_score(y_true_bin[:, class_index], y_proba[:, class_index])
         plt.step(fpr, tpr, where="post", alpha=0.75, label=f"{class_label} (AUC={auc_score:.3f})")
-
-    fpr_micro, tpr_micro, _ = roc_curve(y_true_bin.ravel(), y_proba.ravel())
-    roc_auc_micro = roc_auc_score(y_true_bin, y_proba, average="micro", multi_class="ovr")
-    plt.step(fpr_micro, tpr_micro, where="post", color="black", linewidth=2.0, label=f"micro-average (AUC={roc_auc_micro:.3f})")
-
-    all_fpr = np.unique(np.concatenate([roc_curve(y_true_bin[:, index], y_proba[:, index])[0] for index in class_indices]))
-    mean_tpr = np.zeros_like(all_fpr)
-    for index in class_indices:
-        fpr, tpr, _ = roc_curve(y_true_bin[:, index], y_proba[:, index])
-        mean_tpr += np.interp(all_fpr, fpr, tpr)
-    mean_tpr /= len(class_indices)
-    roc_auc_macro = roc_auc_score(y_true_bin, y_proba, average="macro", multi_class="ovr")
-    plt.step(all_fpr, mean_tpr, where="post", color="#d62728", linewidth=2.0, label=f"macro-average (AUC={roc_auc_macro:.3f})")
 
     plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
     plt.xlabel("False Positive Rate")
@@ -774,19 +1032,6 @@ def save_curves(output_dir: Path, y_true: pd.Series, y_proba: np.ndarray) -> Non
         precision, recall, _ = precision_recall_curve(y_true_bin[:, class_index], y_proba[:, class_index])
         ap_score = average_precision_score(y_true_bin[:, class_index], y_proba[:, class_index])
         plt.step(recall, precision, where="post", alpha=0.75, label=f"{class_label} (AP={ap_score:.3f})")
-
-    precision_micro, recall_micro, _ = precision_recall_curve(y_true_bin.ravel(), y_proba.ravel())
-    ap_micro = average_precision_score(y_true_bin, y_proba, average="micro")
-    plt.step(recall_micro, precision_micro, where="post", color="black", linewidth=2.0, label=f"micro-average (AP={ap_micro:.3f})")
-
-    recall_grid = np.linspace(0, 1, 200)
-    macro_precision = np.zeros_like(recall_grid)
-    for index in class_indices:
-        precision, recall, _ = precision_recall_curve(y_true_bin[:, index], y_proba[:, index])
-        macro_precision += np.interp(recall_grid, recall[::-1], precision[::-1], left=1.0, right=precision[0])
-    macro_precision /= len(class_indices)
-    ap_macro = average_precision_score(y_true_bin, y_proba, average="macro")
-    plt.step(recall_grid, macro_precision, where="post", color="#d62728", linewidth=2.0, label=f"macro-average (AP={ap_macro:.3f})")
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
@@ -898,6 +1143,100 @@ def latest_row_before(frame: pd.DataFrame, key_column: str, key_value: float | s
     return subset.sort_values("date").tail(1)
 
 
+def align_home_order_probabilities(probabilities: np.ndarray) -> np.ndarray:
+    return np.asarray([probabilities[2], probabilities[1], probabilities[0]], dtype=float)
+
+
+def build_prediction_output_row(
+    home_team_name: str,
+    away_team_name: str,
+    prediction_date: str,
+    home_manager_name: str | None,
+    away_manager_name: str | None,
+    probabilities: np.ndarray | None,
+    simulation_runs: int,
+    status: str,
+    error: str | None = None,
+) -> dict[str, object]:
+    row: dict[str, object] = {
+        "home_team": home_team_name,
+        "away_team": away_team_name,
+        "prediction_date": prediction_date,
+        "home_manager": home_manager_name or "",
+        "away_manager": away_manager_name or "",
+        "simulation_runs": simulation_runs,
+        "status": status,
+        "error": error or "",
+    }
+
+    if probabilities is None:
+        row.update(
+            {
+                "prob_loss": np.nan,
+                "prob_draw": np.nan,
+                "prob_win": np.nan,
+                "prob_loss_pct": np.nan,
+                "prob_draw_pct": np.nan,
+                "prob_win_pct": np.nan,
+                "predicted_class": "",
+                "predicted_probability": np.nan,
+                "predicted_probability_pct": np.nan,
+                "runner_up_class": "",
+                "runner_up_probability": np.nan,
+                "runner_up_probability_pct": np.nan,
+                "margin_probability": np.nan,
+                "margin_probability_pct": np.nan,
+                "result_summary": error or "",
+            }
+        )
+        return row
+
+    probabilities = np.asarray(probabilities, dtype=float)
+    predicted_index = int(np.argmax(probabilities))
+    ordered_indices = np.argsort(probabilities)[::-1]
+    runner_up_index = int(ordered_indices[1]) if len(ordered_indices) > 1 else predicted_index
+    predicted_class = RESULT_LABELS[predicted_index]
+    runner_up_class = RESULT_LABELS[runner_up_index]
+    predicted_probability = float(probabilities[predicted_index])
+    runner_up_probability = float(probabilities[runner_up_index])
+    margin_probability = predicted_probability - runner_up_probability
+
+    row.update(
+        {
+            "prob_loss": float(probabilities[0]),
+            "prob_draw": float(probabilities[1]),
+            "prob_win": float(probabilities[2]),
+            "prob_loss_pct": round(float(probabilities[0]) * 100.0, 1),
+            "prob_draw_pct": round(float(probabilities[1]) * 100.0, 1),
+            "prob_win_pct": round(float(probabilities[2]) * 100.0, 1),
+            "predicted_class": predicted_class,
+            "predicted_probability": predicted_probability,
+            "predicted_probability_pct": round(predicted_probability * 100.0, 1),
+            "runner_up_class": runner_up_class,
+            "runner_up_probability": runner_up_probability,
+            "runner_up_probability_pct": round(runner_up_probability * 100.0, 1),
+            "margin_probability": margin_probability,
+            "margin_probability_pct": round(margin_probability * 100.0, 1),
+            "result_summary": (
+                f"{home_team_name} vs {away_team_name} | "
+                f"WIN {probabilities[2] * 100.0:.1f}% | "
+                f"DRAW {probabilities[1] * 100.0:.1f}% | "
+                f"LOSS {probabilities[0] * 100.0:.1f}% | "
+                f"Odds WIN {1 / probabilities[2]:.2f} | "
+                f"Odds DRAW {1 / probabilities[1]:.2f} | "
+                f"Odds LOSS {1 / probabilities[0]:.2f}"
+            ),
+        }
+    )
+    return row
+
+
+def predict_match_probabilities(model: Pipeline, feature_columns: list[str], inference_row: pd.DataFrame) -> np.ndarray:
+    inference_row = inference_row.loc[:, ~inference_row.columns.duplicated()].copy()
+    inference_features = inference_row.reindex(columns=feature_columns, fill_value=np.nan)
+    return model.predict_proba(inference_features)[0]
+
+
 def build_inference_row(
     data_dir: Path,
     team_dim: pd.DataFrame,
@@ -927,7 +1266,7 @@ def build_inference_row(
     home_team_id = resolve_team_id(team_dim, home_team_name)
     away_team_id = resolve_team_id(team_dim, away_team_name)
     if pd.isna(home_team_id) or pd.isna(away_team_id):
-        raise ValueError("Could not resolve one or both team names against the available datasets")
+        raise InputError("Could not resolve one or both team names against the available datasets")
 
     historical_games = games[games["date"].lt(as_of_date)].copy()
     historical_game_ids = set(historical_games["game_id"].dropna().astype(int).tolist())
@@ -959,7 +1298,7 @@ def build_inference_row(
     home_history = latest_row_before(team_history, "club_id", home_team_id, as_of_date)
     away_history = latest_row_before(team_history, "club_id", away_team_id, as_of_date)
     if home_history.empty or away_history.empty:
-        raise ValueError("Could not find enough historical team data for one of the selected teams")
+        raise InputError("Could not find enough historical team data for one of the selected teams")
 
     if home_manager_name:
         home_manager_history = latest_row_before(manager_history, "manager_name", home_manager_name, as_of_date)
@@ -1064,9 +1403,10 @@ def run_inference(
     away_starting: list[str],
     away_subs: list[str],
     as_of_date_text: str | None,
+    neutral_site: bool,
     output_dir: Path,
 ) -> dict[str, object]:
-    inference_row, metadata = build_inference_row(
+    home_inference_row, home_metadata = build_inference_row(
         data_dir=data_dir,
         team_dim=team_dim,
         team_history=team_history,
@@ -1089,11 +1429,61 @@ def run_inference(
         as_of_date_text=as_of_date_text,
     )
 
-    inference_row = inference_row.loc[:, ~inference_row.columns.duplicated()].copy()
-    inference_features = inference_row.reindex(columns=feature_columns, fill_value=np.nan)
-    probabilities = model.predict_proba(inference_features)[0]
+    home_probabilities = predict_match_probabilities(model, feature_columns, home_inference_row)
+
+    prediction_orders: list[dict[str, object]] = [
+        {
+            **home_metadata,
+            "ordering": f"{home_team_name} vs {away_team_name}",
+            "prob_loss": float(home_probabilities[0]),
+            "prob_draw": float(home_probabilities[1]),
+            "prob_win": float(home_probabilities[2]),
+            "predicted_class": RESULT_LABELS[int(np.argmax(home_probabilities))],
+        }
+    ]
+
+    if neutral_site:
+        away_inference_row, away_metadata = build_inference_row(
+            data_dir=data_dir,
+            team_dim=team_dim,
+            team_history=team_history,
+            manager_history=manager_history,
+            club_event_history=club_event_history,
+            players=players,
+            player_valuations=player_valuations,
+            transfers=transfers,
+            game_events=game_events,
+            games=games,
+            competition_scope=competition_scope,
+            home_team_name=away_team_name,
+            away_team_name=home_team_name,
+            home_manager_name=away_manager_name,
+            away_manager_name=home_manager_name,
+            home_starting=away_starting,
+            home_subs=away_subs,
+            away_starting=home_starting,
+            away_subs=home_subs,
+            as_of_date_text=as_of_date_text,
+        )
+        away_probabilities = predict_match_probabilities(model, feature_columns, away_inference_row)
+        prediction_orders.append(
+            {
+                **away_metadata,
+                "ordering": f"{away_team_name} vs {home_team_name}",
+                "prob_loss": float(away_probabilities[0]),
+                "prob_draw": float(away_probabilities[1]),
+                "prob_win": float(away_probabilities[2]),
+                "predicted_class": RESULT_LABELS[int(np.argmax(away_probabilities))],
+            }
+        )
+        probabilities = (home_probabilities + align_home_order_probabilities(away_probabilities)) / 2.0
+    else:
+        probabilities = home_probabilities
+
     result = {
-        **metadata,
+        **home_metadata,
+        "neutral_site": neutral_site,
+        "order_predictions": prediction_orders,
         "prob_loss": float(probabilities[0]),
         "prob_draw": float(probabilities[1]),
         "prob_win": float(probabilities[2]),
@@ -1104,150 +1494,566 @@ def run_inference(
     return result
 
 
-def main() -> None:
-    args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Loading datasets...")
-    games = load_csv(args.data_dir, "games.csv")
-    club_games = load_csv(args.data_dir, "club_games.csv")
-    clubs = load_csv(args.data_dir, "clubs.csv")
-    competitions = load_csv(args.data_dir, "competitions.csv")
-    countries = load_csv(args.data_dir, "countries.csv")
-    national_teams = load_csv(args.data_dir, "national_teams.csv")
-    players = load_csv(args.data_dir, "players.csv")
-    player_valuations = load_csv(args.data_dir, "player_valuations.csv")
-    transfers = load_csv(args.data_dir, "transfers.csv")
-    game_lineups = load_csv(args.data_dir, "game_lineups.csv")
-    game_events = load_csv(args.data_dir, "game_events.csv")
-
-    games["game_id"] = to_numeric_id(games["game_id"])
-    games["date"] = to_datetime(games["date"])
-    games["home_club_id"] = to_numeric_id(games["home_club_id"])
-    games["away_club_id"] = to_numeric_id(games["away_club_id"])
-    games["competition_type"] = games["competition_type"].fillna("unknown")
-    games["round"] = games["round"].fillna("unknown")
-
-    if args.competition_scope != "all":
-        games = games[games["competition_type"] == args.competition_scope].copy()
-
-    valid_game_ids = set(games["game_id"].dropna().astype(int).tolist())
-    club_games = club_games[to_numeric_id(club_games["game_id"]).isin(valid_game_ids)].copy()
-    game_lineups = game_lineups[to_numeric_id(game_lineups["game_id"]).isin(valid_game_ids)].copy()
-    game_events = game_events[to_numeric_id(game_events["game_id"]).isin(valid_game_ids)].copy()
-
-    print("Building team and manager histories...")
-    team_dim = normalize_team_dim(clubs, national_teams, competitions, countries)
-    team_history = build_team_history(club_games, games)
-    manager_history = build_manager_history(team_history)
-    club_event_history = build_club_event_history(game_events, games)
-
-    print("Building lineup and player profiles...")
-    lineup_player_features = build_lineup_player_features(game_lineups, games, players, game_events, player_valuations, transfers)
-    lineup_summary = aggregate_lineup_features(lineup_player_features)
-
-    print("Building match-level feature table...")
-    team_profile = build_team_profile(games, team_history, manager_history, club_event_history, lineup_summary, team_dim)
-    pair = build_diff_features(team_profile)
-
-    print("Splitting data by time and training RandomForest...")
-    features, y, numeric_columns, categorical_columns = build_feature_matrix(pair)
-    x_train, x_test, y_train, y_test, train_dates, test_dates = time_based_split(
-        features, y, pair["date"], args.test_fraction, args.min_test_games
-    )
-
-    model = build_model(numeric_columns, categorical_columns, args.n_estimators, args.random_state)
-    model.fit(x_train, y_train)
-
-    print("Evaluating model and writing predictions...")
-    y_pred = model.predict(x_test)
-    y_proba = model.predict_proba(x_test)
-
-    metrics = {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "log_loss": float(log_loss(y_test, y_proba, labels=[0, 1, 2])),
-        "roc_auc_ovr_macro": float(roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")),
-        "train_size": int(len(x_train)),
-        "test_size": int(len(x_test)),
-        "train_last_date": str(pd.Series(train_dates).dropna().max().date()),
-        "test_first_date": str(pd.Series(test_dates).dropna().min().date()),
-        "classification_report": classification_report(
-            y_test,
-            y_pred,
-            target_names=[RESULT_LABELS[index] for index in [0, 1, 2]],
-            output_dict=True,
-            zero_division=0,
-        ),
-    }
-    with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2, ensure_ascii=False)
-
-    prediction_frame = x_test.copy()
-    prediction_frame["true_label"] = y_test.values
-    prediction_frame["pred_label"] = y_pred
-    prediction_frame["prob_loss"] = y_proba[:, 0]
-    prediction_frame["prob_draw"] = y_proba[:, 1]
-    prediction_frame["prob_win"] = y_proba[:, 2]
-    prediction_frame.to_csv(args.output_dir / "test_predictions.csv", index=False)
-
-    save_curves(args.output_dir, y_test, y_proba)
-    importance = save_feature_importance(args.output_dir, model)
-
+def load_prediction_csv(csv_path: Path) -> pd.DataFrame:
+    """load and validate batch prediction CSV file."""
+    if not csv_path.exists():
+        raise InputError(f"Prediction CSV file not found: {csv_path}")
+    
     try:
-        import joblib
+        df = pd.read_csv(csv_path, low_memory=False)
+    except Exception as exc:
+        raise InputError(f"Failed to read prediction CSV file {csv_path}: {exc}") from exc
+    
+    required_columns = [
+        "prediction_date", "home_team", "away_team",
+        "home_manager", "away_manager",
+        "home_starting", "home_subs", "away_starting", "away_subs"
+    ]
+    
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise InputError(f"Missing required columns in CSV: {', '.join(missing_columns)}")
+    
+    if df.empty:
+        raise InputError("Prediction CSV file is empty")
+    
+    return df
 
-        joblib.dump(model, args.output_dir / "random_forest_model.joblib")
-    except Exception:
-        pass
 
-    prediction_request = None
-    if args.predict_home_team and args.predict_away_team:
-        prediction_request = {
-            "home_team_name": args.predict_home_team,
-            "away_team_name": args.predict_away_team,
-            "home_manager_name": args.predict_home_manager,
-            "away_manager_name": args.predict_away_manager,
-            "home_starting": parse_name_list(args.predict_home_starting),
-            "home_subs": parse_name_list(args.predict_home_subs),
-            "away_starting": parse_name_list(args.predict_away_starting),
-            "away_subs": parse_name_list(args.predict_away_subs),
-            "as_of_date_text": args.predict_as_of_date,
-        }
-    elif sys.stdin.isatty():
-        prediction_request = prompt_interactive_inference()
+def validate_prediction_csv_row(
+    row: pd.Series,
+    team_dim: pd.DataFrame,
+    games: pd.DataFrame,
+    index: int,
+) -> list[str]:
+    """validate a single prediction CSV row."""
+    issues: list[str] = []
+    row_prefix = f"Row {index + 2}: "  # +2 for header and 1-based indexing
+    
+    # validate date
+    as_of_date_text = str(row.get("prediction_date", "")).strip()
+    if not as_of_date_text:
+        issues.append(f"{row_prefix}prediction_date is required")
+    else:
+        parsed_date = pd.to_datetime(as_of_date_text, errors="coerce")
+        if pd.isna(parsed_date):
+            issues.append(f"{row_prefix}prediction_date is not a valid date format (YYYY-MM-DD)")
+    
+    # validate team names
+    home_team_name = str(row.get("home_team", "")).strip()
+    away_team_name = str(row.get("away_team", "")).strip()
+    
+    if not home_team_name:
+        issues.append(f"{row_prefix}home_team is required")
+    if not away_team_name:
+        issues.append(f"{row_prefix}away_team is required")
+    
+    if home_team_name and away_team_name and normalize_name(home_team_name) == normalize_name(away_team_name):
+        issues.append(f"{row_prefix}home_team and away_team must be different")
+    
+    if home_team_name:
+        if find_team_matches(team_dim, home_team_name).empty:
+            issues.append(f"{row_prefix}home_team '{home_team_name}' not found in database")
+        elif len(find_team_matches(team_dim, home_team_name)) > 1:
+            issues.append(f"{row_prefix}home_team '{home_team_name}' matches multiple teams (ambiguous)")
+    
+    if away_team_name:
+        if find_team_matches(team_dim, away_team_name).empty:
+            issues.append(f"{row_prefix}away_team '{away_team_name}' not found in database")
+        elif len(find_team_matches(team_dim, away_team_name)) > 1:
+            issues.append(f"{row_prefix}away_team '{away_team_name}' matches multiple teams (ambiguous)")
+    
+    # validate manager names
+    home_manager_name = str(row.get("home_manager", "")).strip() if pd.notna(row.get("home_manager")) else ""
+    away_manager_name = str(row.get("away_manager", "")).strip() if pd.notna(row.get("away_manager")) else ""
+    
+    if home_manager_name and away_manager_name and normalize_name(home_manager_name) == normalize_name(away_manager_name):
+        issues.append(f"{row_prefix}home_manager and away_manager must be different")
+    
+    # parse lineups using CSV-aware parser
+    home_starting = parse_csv_name_list(str(row.get("home_starting", "")))
+    home_subs = parse_csv_name_list(str(row.get("home_subs", "")))
+    away_starting = parse_csv_name_list(str(row.get("away_starting", "")))
+    away_subs = parse_csv_name_list(str(row.get("away_subs", "")))
+    
+    # validate starting lineup counts
+    if len(home_starting) != 11:
+        issues.append(f"{row_prefix}home_starting must contain exactly 11 players (got {len(home_starting)})")
+    if len(away_starting) != 11:
+        issues.append(f"{row_prefix}away_starting must contain exactly 11 players (got {len(away_starting)})")
+    
+    # check for duplicates within team
+    for label, values in [
+        ("home_starting", home_starting),
+        ("home_subs", home_subs),
+        ("away_starting", away_starting),
+        ("away_subs", away_subs),
+    ]:
+        normalized_values = [normalize_name(v) for v in values]
+        duplicates = [v for v in set(normalized_values) if v and normalized_values.count(v) > 1]
+        if duplicates:
+            issues.append(f"{row_prefix}{label} contains duplicate players: {', '.join(duplicates)}")
+    
+    # check for overlap between teams
+    home_roster = {normalize_name(v) for v in home_starting + home_subs if normalize_name(v)}
+    away_roster = {normalize_name(v) for v in away_starting + away_subs if normalize_name(v)}
+    overlap = sorted(home_roster & away_roster)
+    if overlap:
+        issues.append(f"{row_prefix}player rosters overlap: {', '.join(overlap)}")
+    
+    return issues
 
-    if prediction_request:
-        inference_result = run_inference(
-            model=model,
-            feature_columns=list(x_train.columns),
-            data_dir=args.data_dir,
-            team_dim=team_dim,
-            team_history=team_history,
-            manager_history=manager_history,
-            club_event_history=club_event_history,
-            players=players,
-            player_valuations=player_valuations,
-            transfers=transfers,
-            game_events=game_events,
-            games=games,
-            competition_scope=args.competition_scope,
-            home_team_name=prediction_request["home_team_name"],
-            away_team_name=prediction_request["away_team_name"],
-            home_manager_name=prediction_request["home_manager_name"],
-            away_manager_name=prediction_request["away_manager_name"],
-            home_starting=prediction_request["home_starting"],
-            home_subs=prediction_request["home_subs"],
-            away_starting=prediction_request["away_starting"],
-            away_subs=prediction_request["away_subs"],
-            as_of_date_text=prediction_request["as_of_date_text"],
-            output_dir=args.output_dir,
+
+def run_batch_simulations(
+    model: Pipeline,
+    feature_columns: list[str],
+    data_dir: Path,
+    team_dim: pd.DataFrame,
+    team_history: pd.DataFrame,
+    manager_history: pd.DataFrame,
+    club_event_history: pd.DataFrame,
+    players: pd.DataFrame,
+    player_valuations: pd.DataFrame,
+    transfers: pd.DataFrame,
+    game_events: pd.DataFrame,
+    games: pd.DataFrame,
+    competition_scope: str,
+    prediction_csv: pd.DataFrame,
+    simulation_runs: int,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """run batch predictions with simulations for different lineup combinations."""
+    results = []
+    
+    for idx, row in prediction_csv.iterrows():
+        print(f"\nProcessing match {idx + 1}/{len(prediction_csv)}...")
+        
+        # validate row
+        validation_issues = validate_prediction_csv_row(row, team_dim, games, idx)
+        if validation_issues:
+            print(f"  Validation errors:")
+            for issue in validation_issues:
+                print(f"    - {issue}")
+            continue
+        
+        try:
+            home_team_name = str(row["home_team"]).strip()
+            away_team_name = str(row["away_team"]).strip()
+            home_manager_name = str(row["home_manager"]).strip() if pd.notna(row["home_manager"]) and str(row["home_manager"]).strip() else None
+            away_manager_name = str(row["away_manager"]).strip() if pd.notna(row["away_manager"]) and str(row["away_manager"]).strip() else None
+            as_of_date_text = str(row["prediction_date"]).strip()
+            
+            home_starting = parse_csv_name_list(str(row["home_starting"]))
+            home_subs = parse_csv_name_list(str(row["home_subs"]))
+            away_starting = parse_csv_name_list(str(row["away_starting"]))
+            away_subs = parse_csv_name_list(str(row["away_subs"]))
+            
+            # run simulations with random lineup variations
+            home_probs_list = []
+            away_probs_list = []
+            
+            for sim in range(simulation_runs):
+                # shuffle substitutes within starting and subs to create variations
+                home_starting_var = home_starting.copy()
+                home_subs_var = home_subs.copy()
+                away_starting_var = away_starting.copy()
+                away_subs_var = away_subs.copy()
+                
+                # randomly swap some starters with subs to create different lineups
+                if home_subs_var:
+                    swap_count = np.random.randint(0, min(3, len(home_subs_var)) + 1)
+                    for _ in range(swap_count):
+                        starter_idx = np.random.randint(0, len(home_starting_var))
+                        sub_idx = np.random.randint(0, len(home_subs_var))
+                        home_starting_var[starter_idx], home_subs_var[sub_idx] = home_subs_var[sub_idx], home_starting_var[starter_idx]
+                
+                if away_subs_var:
+                    swap_count = np.random.randint(0, min(3, len(away_subs_var)) + 1)
+                    for _ in range(swap_count):
+                        starter_idx = np.random.randint(0, len(away_starting_var))
+                        sub_idx = np.random.randint(0, len(away_subs_var))
+                        away_starting_var[starter_idx], away_subs_var[sub_idx] = away_subs_var[sub_idx], away_starting_var[starter_idx]
+                
+                # build and predict for this simulation
+                home_inference_row, _ = build_inference_row(
+                    data_dir=data_dir,
+                    team_dim=team_dim,
+                    team_history=team_history,
+                    manager_history=manager_history,
+                    club_event_history=club_event_history,
+                    players=players,
+                    player_valuations=player_valuations,
+                    transfers=transfers,
+                    game_events=game_events,
+                    games=games,
+                    competition_scope=competition_scope,
+                    home_team_name=home_team_name,
+                    away_team_name=away_team_name,
+                    home_manager_name=home_manager_name,
+                    away_manager_name=away_manager_name,
+                    home_starting=home_starting_var,
+                    home_subs=home_subs_var,
+                    away_starting=away_starting_var,
+                    away_subs=away_subs_var,
+                    as_of_date_text=as_of_date_text,
+                )
+                
+                home_probs = predict_match_probabilities(model, feature_columns, home_inference_row)
+                home_probs_list.append(home_probs)
+                
+                # also get away team perspective if we want neutral site
+                away_inference_row, _ = build_inference_row(
+                    data_dir=data_dir,
+                    team_dim=team_dim,
+                    team_history=team_history,
+                    manager_history=manager_history,
+                    club_event_history=club_event_history,
+                    players=players,
+                    player_valuations=player_valuations,
+                    transfers=transfers,
+                    game_events=game_events,
+                    games=games,
+                    competition_scope=competition_scope,
+                    home_team_name=away_team_name,
+                    away_team_name=home_team_name,
+                    home_manager_name=away_manager_name,
+                    away_manager_name=home_manager_name,
+                    home_starting=away_starting_var,
+                    home_subs=away_subs_var,
+                    away_starting=home_starting_var,
+                    away_subs=home_subs_var,
+                    as_of_date_text=as_of_date_text,
+                )
+                
+                away_probs = predict_match_probabilities(model, feature_columns, away_inference_row)
+                away_probs_list.append(away_probs)
+                
+                if (sim + 1) % max(1, simulation_runs // 10) == 0:
+                    print(f"  Completed {sim + 1}/{simulation_runs} simulations")
+            
+            # average the probabilities
+            avg_home_probs = np.mean(home_probs_list, axis=0)
+            avg_away_probs = np.mean(away_probs_list, axis=0)
+            # align away probs to home perspective and average
+            avg_away_probs_aligned = align_home_order_probabilities(avg_away_probs)
+            final_probs = (avg_home_probs + avg_away_probs_aligned) / 2.0
+            result = build_prediction_output_row(
+                home_team_name=home_team_name,
+                away_team_name=away_team_name,
+                prediction_date=as_of_date_text,
+                home_manager_name=home_manager_name,
+                away_manager_name=away_manager_name,
+                probabilities=final_probs,
+                simulation_runs=simulation_runs,
+                status="success",
+            )
+            results.append(result)
+            print(f"  {result['result_summary']}")
+        
+        except InputError as exc:
+            result = build_prediction_output_row(
+                home_team_name=str(row.get("home_team", "")),
+                away_team_name=str(row.get("away_team", "")),
+                prediction_date=str(row.get("prediction_date", "")),
+                home_manager_name=str(row.get("home_manager", "")) or None,
+                away_manager_name=str(row.get("away_manager", "")) or None,
+                probabilities=None,
+                simulation_runs=simulation_runs,
+                status="error",
+                error=str(exc),
+            )
+            results.append(result)
+            print(f"  Error: {exc}")
+        except Exception as exc:
+            result = build_prediction_output_row(
+                home_team_name=str(row.get("home_team", "")),
+                away_team_name=str(row.get("away_team", "")),
+                prediction_date=str(row.get("prediction_date", "")),
+                home_manager_name=str(row.get("home_manager", "")) or None,
+                away_manager_name=str(row.get("away_manager", "")) or None,
+                probabilities=None,
+                simulation_runs=simulation_runs,
+                status="error",
+                error=f"Unexpected error: {exc}",
+            )
+            results.append(result)
+            print(f"  Unexpected error: {exc}")
+    
+    results_df = pd.DataFrame(results)
+    preferred_columns = [
+        "prediction_date",
+        "home_team",
+        "away_team",
+        "home_manager",
+        "away_manager",
+        "predicted_class",
+        "predicted_probability_pct",
+        "runner_up_class",
+        "runner_up_probability_pct",
+        "margin_probability_pct",
+        "prob_win_pct",
+        "prob_draw_pct",
+        "prob_loss_pct",
+        "result_summary",
+        "simulation_runs",
+        "status",
+        "error",
+    ]
+    remaining_columns = [column for column in results_df.columns if column not in preferred_columns]
+    results_df = results_df.reindex(columns=[*preferred_columns, *remaining_columns])
+    results_csv_path = output_dir / "batch_predictions_results.csv"
+    results_df.to_csv(results_csv_path, index=False)
+    
+    return results_df
+
+
+def main() -> None:
+    try:
+        args = parse_args()
+        if args.test_fraction <= 0 or args.test_fraction >= 1:
+            raise InputError("--test-fraction must be greater than 0 and less than 1")
+        if args.min_test_games <= 0:
+            raise InputError("--min-test-games must be greater than 0")
+        if args.n_estimators <= 0:
+            raise InputError("--n-estimators must be greater than 0")
+        if not args.data_dir.exists():
+            raise InputError(f"Data directory does not exist: {args.data_dir}")
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        validate_required_csv_files(args.data_dir)
+
+        print("Loading datasets...")
+        games = load_csv(args.data_dir, "games.csv")
+        club_games = load_csv(args.data_dir, "club_games.csv")
+        clubs = load_csv(args.data_dir, "clubs.csv")
+        competitions = load_csv(args.data_dir, "competitions.csv")
+        countries = load_csv(args.data_dir, "countries.csv")
+        national_teams = load_csv(args.data_dir, "national_teams.csv")
+        players = load_csv(args.data_dir, "players.csv")
+        player_valuations = load_csv(args.data_dir, "player_valuations.csv")
+        transfers = load_csv(args.data_dir, "transfers.csv")
+        game_lineups = load_csv(args.data_dir, "game_lineups.csv")
+        game_events = load_csv(args.data_dir, "game_events.csv")
+        games["game_id"] = to_numeric_id(games["game_id"])
+        games["date"] = to_datetime(games["date"])
+        games["home_club_id"] = to_numeric_id(games["home_club_id"])
+        games["away_club_id"] = to_numeric_id(games["away_club_id"])
+        games["competition_type"] = games["competition_type"].fillna("unknown")
+        games["round"] = games["round"].fillna("unknown")
+
+        if args.competition_scope != "all":
+            games = games[games["competition_type"] == args.competition_scope].copy()
+
+        valid_game_ids = set(games["game_id"].dropna().astype(int).tolist())
+        club_games = club_games[to_numeric_id(club_games["game_id"]).isin(valid_game_ids)].copy()
+        game_lineups = game_lineups[to_numeric_id(game_lineups["game_id"]).isin(valid_game_ids)].copy()
+        game_events = game_events[to_numeric_id(game_events["game_id"]).isin(valid_game_ids)].copy()
+
+        print("Building team and manager histories...")
+        team_dim = normalize_team_dim(clubs, national_teams, competitions, countries)
+        team_history = build_team_history(club_games, games)
+        manager_history = build_manager_history(team_history)
+        club_event_history = build_club_event_history(game_events, games)
+
+        print("Building lineup and player profiles...")
+        lineup_player_features = build_lineup_player_features(game_lineups, games, players, game_events, player_valuations, transfers)
+        lineup_summary = aggregate_lineup_features(lineup_player_features)
+
+        print("Building match-level feature table...")
+        team_profile = build_team_profile(games, team_history, manager_history, club_event_history, lineup_summary, team_dim)
+        pair = build_diff_features(team_profile)
+
+        model_path = args.output_dir / "random_forest_model.joblib"
+        features_path = args.output_dir / "feature_columns.json"
+
+        if args.mode == "train":
+            print("Splitting data by time and training RandomForest...")
+            features, y, numeric_columns, categorical_columns = build_feature_matrix(pair)
+            x_train, x_test, y_train, y_test, train_dates, test_dates = time_based_split(
+                features, y, pair["date"], args.test_fraction, args.min_test_games
+            )
+
+            model = build_model(numeric_columns, categorical_columns, args.n_estimators, args.random_state)
+            model.fit(x_train, y_train)
+
+            print("Evaluating model and writing predictions...")
+            y_pred = model.predict(x_test)
+            y_proba = model.predict_proba(x_test)
+
+            metrics = {
+                "accuracy": float(accuracy_score(y_test, y_pred)),
+                "log_loss": float(log_loss(y_test, y_proba, labels=[0, 1, 2])),
+                "roc_auc_ovr_macro": float(roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")),
+                "train_size": int(len(x_train)),
+                "test_size": int(len(x_test)),
+                "train_last_date": str(pd.Series(train_dates).dropna().max().date()),
+                "test_first_date": str(pd.Series(test_dates).dropna().min().date()),
+                "classification_report": classification_report(
+                    y_test,
+                    y_pred,
+                    target_names=[RESULT_LABELS[index] for index in [0, 1, 2]],
+                    output_dict=True,
+                    zero_division=0,
+                ),
+            }
+            with open(args.output_dir / "metrics.json", "w", encoding="utf-8") as handle:
+                json.dump(metrics, handle, indent=2, ensure_ascii=False)
+
+            prediction_frame = x_test.copy()
+            prediction_frame["true_label"] = y_test.values
+            prediction_frame["pred_label"] = y_pred
+            prediction_frame["prob_loss"] = y_proba[:, 0]
+            prediction_frame["prob_draw"] = y_proba[:, 1]
+            prediction_frame["prob_win"] = y_proba[:, 2]
+            prediction_frame.to_csv(args.output_dir / "test_predictions.csv", index=False)
+
+            save_curves(args.output_dir, y_test, y_proba)
+            importance = save_feature_importance(args.output_dir, model)
+
+            try:
+                import joblib
+                joblib.dump(model, model_path)
+                with open(features_path, "w", encoding="utf-8") as handle:
+                    json.dump(list(x_train.columns), handle)
+            except Exception as exc:
+                print(f"Warning: Failed to save model/features: {exc}")
+
+            feature_cols_list = list(x_train.columns)
+            print(f"Accuracy: {metrics['accuracy']:.4f}")
+
+        elif args.mode == "predict":
+            print("Loading saved model...")
+            import joblib
+            if not model_path.exists() or not features_path.exists():
+                raise InputError("Saved model or features not found. Please run with '--mode train' first.")
+            
+            model = joblib.load(model_path)
+            with open(features_path, "r", encoding="utf-8") as handle:
+                feature_cols_list = json.load(handle)
+
+        prediction_request = None
+        prediction_args_present = any(
+            [
+                args.predict_home_team,
+                args.predict_away_team,
+                args.predict_home_manager,
+                args.predict_away_manager,
+                args.predict_home_starting,
+                args.predict_home_subs,
+                args.predict_away_starting,
+                args.predict_away_subs,
+                args.predict_as_of_date,
+            ]
         )
-        print(json.dumps(inference_result, indent=2, ensure_ascii=False))
+        if args.predict_home_team or args.predict_away_team:
+            if not (args.predict_home_team and args.predict_away_team):
+                raise InputError("Both --predict-home-team and --predict-away-team are required when requesting inference")
+            prediction_request = {
+                "home_team_name": args.predict_home_team,
+                "away_team_name": args.predict_away_team,
+                "home_manager_name": args.predict_home_manager,
+                "away_manager_name": args.predict_away_manager,
+                "home_starting": parse_name_list(args.predict_home_starting),
+                "home_subs": parse_name_list(args.predict_home_subs),
+                "away_starting": parse_name_list(args.predict_away_starting),
+                "away_subs": parse_name_list(args.predict_away_subs),
+                "as_of_date_text": args.predict_as_of_date,
+                "neutral_site": args.neutral_site,
+            }
+            issues = validate_prediction_request(prediction_request, team_dim, games)
+            if issues:
+                raise InputError("; ".join(issues))
+        elif args.prediction_csv:
+            prediction_csv = load_prediction_csv(args.prediction_csv)
+            
+            batch_results = run_batch_simulations(
+                model=model,
+                feature_columns=feature_cols_list,
+                data_dir=args.data_dir,
+                team_dim=team_dim,
+                team_history=team_history,
+                manager_history=manager_history,
+                club_event_history=club_event_history,
+                players=players,
+                player_valuations=player_valuations,
+                transfers=transfers,
+                game_events=game_events,
+                games=games,
+                competition_scope=args.competition_scope,
+                prediction_csv=prediction_csv,
+                simulation_runs=args.simulation_runs,
+                output_dir=args.output_dir,
+            )
+            prediction_request = None  # Skip interactive inference
+        elif sys.stdin.isatty():
+            if prompt_yes_no("\nProcess batch predictions from CSV file? (y/n)", "n"):
+                csv_path_str = prompt_text("CSV file path", "sample_predictions.csv")
+                if csv_path_str:
+                    csv_path = Path(csv_path_str)
+                    prediction_csv = load_prediction_csv(csv_path)
+                    
+                    batch_results = run_batch_simulations(
+                        model=model,
+                        feature_columns=feature_cols_list,
+                        data_dir=args.data_dir,
+                        team_dim=team_dim,
+                        team_history=team_history,
+                        manager_history=manager_history,
+                        club_event_history=club_event_history,
+                        players=players,
+                        player_valuations=player_valuations,
+                        transfers=transfers,
+                        game_events=game_events,
+                        games=games,
+                        competition_scope=args.competition_scope,
+                        prediction_csv=prediction_csv,
+                        simulation_runs=args.simulation_runs,
+                        output_dir=args.output_dir,
+                    )
+                    prediction_request = None
+                else:
+                    prediction_request = prompt_interactive_inference(team_dim, players, games)
+            else:
+                prediction_request = prompt_interactive_inference(team_dim, players, games)
+        elif prediction_args_present:
+            raise InputError("Prediction inputs were provided, but they were incomplete")
 
-    print("Done.")
-    print("Training complete")
-    print(json.dumps({k: v for k, v in metrics.items() if k != "classification_report"}, indent=2))
-    print(f"Saved {len(importance)} feature importances to {args.output_dir}")
+        if prediction_request:
+            inference_result = run_inference(
+                model=model,
+                feature_columns=feature_cols_list,
+                data_dir=args.data_dir,
+                team_dim=team_dim,
+                team_history=team_history,
+                manager_history=manager_history,
+                club_event_history=club_event_history,
+                players=players,
+                player_valuations=player_valuations,
+                transfers=transfers,
+                game_events=game_events,
+                games=games,
+                competition_scope=args.competition_scope,
+                home_team_name=prediction_request["home_team_name"],
+                away_team_name=prediction_request["away_team_name"],
+                home_manager_name=prediction_request["home_manager_name"],
+                away_manager_name=prediction_request["away_manager_name"],
+                home_starting=prediction_request["home_starting"],
+                home_subs=prediction_request["home_subs"],
+                away_starting=prediction_request["away_starting"],
+                away_subs=prediction_request["away_subs"],
+                as_of_date_text=prediction_request["as_of_date_text"],
+                neutral_site=prediction_request["neutral_site"],
+                output_dir=args.output_dir,
+            )
+            print(json.dumps(inference_result, indent=2, ensure_ascii=False))
+
+        print("Done.")
+    except (InputError, FileNotFoundError) as exc:
+        print(f"Input error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except KeyboardInterrupt:
+        print("Input cancelled by user", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
