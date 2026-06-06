@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-away-subs", type=str, default=None)
     parser.add_argument("--predict-as-of-date", type=str, default=None)
     parser.add_argument("--neutral-site", action="store_true", help="Average both team orderings for a neutral venue prediction")
-    parser.add_argument("--prediction-csv", type=Path, default=None, help="Path to CSV file with batch predictions (9 columns: prediction_date, home_team, away_team, home_manager, away_manager, home_starting, home_subs, away_starting, away_subs)")
+    parser.add_argument("--prediction-csv", type=Path, default=None, help="Path to CSV file with batch predictions")
     parser.add_argument("--simulation-runs", type=int, default=1, help="Number of simulation runs for CSV batch predictions")
     return parser.parse_args()
 
@@ -140,13 +140,10 @@ def parse_name_list(value: str | None) -> list[str]:
 
 
 def parse_csv_name_list(value: str | None) -> list[str]:
-    """Parse names from CSV column - supports both comma and semicolon separators."""
     if not value:
         return []
-    # check if semicolon is used (preferred for CSV to avoid conflicts with commas in names)
     if ";" in str(value):
         return [item.strip() for item in str(value).split(";") if item.strip()]
-    # fall back to comma
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
@@ -396,12 +393,6 @@ def role_from_position(position: object) -> str:
     if pd.isna(position):
         return "unknown"
     return ROLE_MAP.get(str(position), "unknown")
-
-
-def prefix_non_keys(frame: pd.DataFrame, prefix: str, key_columns: list[str]) -> pd.DataFrame:
-    renamed = frame.copy()
-    rename_map = {column: f"{prefix}{column}" for column in renamed.columns if column not in key_columns}
-    return renamed.rename(columns=rename_map)
 
 
 def normalize_team_dim(
@@ -660,11 +651,10 @@ def merge_asof_player_safe(
 
 def build_lineup_player_features(
     game_lineups: pd.DataFrame,
-    games: pd.DataFrame,
     players: pd.DataFrame,
-    game_events: pd.DataFrame,
-    player_valuations: pd.DataFrame,
-    transfers: pd.DataFrame,
+    player_events: pd.DataFrame,
+    valuation_history: pd.DataFrame,
+    transfer_history: pd.DataFrame,
 ) -> pd.DataFrame:
     frame = game_lineups.copy()
     frame["game_id"] = to_numeric_id(frame["game_id"])
@@ -691,7 +681,6 @@ def build_lineup_player_features(
     frame["sub_before"] = frame.groupby("player_id")["is_substitute"].transform(lambda s: s.shift(1).fillna(0).cumsum())
     frame["captain_before"] = frame.groupby("player_id")["is_captain"].transform(lambda s: s.shift(1).fillna(0).cumsum())
 
-    player_events = build_player_event_history(game_events, games)
     frame = frame.merge(
         player_events[
             [
@@ -712,7 +701,6 @@ def build_lineup_player_features(
         how="left",
     )
 
-    valuation_history = build_valuation_history(player_valuations)
     frame = frame.sort_values(["date", "player_id", "game_id"]).reset_index(drop=True)
     frame = merge_asof_player_safe(
         frame=frame,
@@ -721,7 +709,6 @@ def build_lineup_player_features(
         value_columns=["market_value_before", "valuation_count_before", "days_since_last_valuation"],
     )
 
-    transfer_history = build_transfer_history(transfers)
     frame = merge_asof_player_safe(
         frame=frame,
         history=transfer_history,
@@ -1238,15 +1225,14 @@ def predict_match_probabilities(model: Pipeline, feature_columns: list[str], inf
 
 
 def build_inference_row(
-    data_dir: Path,
     team_dim: pd.DataFrame,
     team_history: pd.DataFrame,
     manager_history: pd.DataFrame,
     club_event_history: pd.DataFrame,
     players: pd.DataFrame,
-    player_valuations: pd.DataFrame,
-    transfers: pd.DataFrame,
-    game_events: pd.DataFrame,
+    player_events: pd.DataFrame,
+    valuation_history: pd.DataFrame,
+    transfer_history: pd.DataFrame,
     games: pd.DataFrame,
     competition_scope: str,
     home_team_name: str,
@@ -1268,11 +1254,8 @@ def build_inference_row(
     if pd.isna(home_team_id) or pd.isna(away_team_id):
         raise InputError("Could not resolve one or both team names against the available datasets")
 
-    historical_games = games[games["date"].lt(as_of_date)].copy()
-    historical_game_ids = set(historical_games["game_id"].dropna().astype(int).tolist())
-    historical_game_events = game_events[to_numeric_id(game_events["game_id"]).isin(historical_game_ids)].copy()
-    historical_player_valuations = player_valuations[to_datetime(player_valuations["date"]).lt(as_of_date)].copy()
-    historical_transfers = transfers[to_datetime(transfers["transfer_date"]).lt(as_of_date)].copy()
+    historical_valuation_history = valuation_history[to_datetime(valuation_history["date"]).lt(as_of_date)].copy()
+    historical_transfer_history = transfer_history[to_datetime(transfer_history["transfer_date"]).lt(as_of_date)].copy()
 
     custom_lineups = build_custom_lineups(
         home_team_id=home_team_id,
@@ -1287,11 +1270,10 @@ def build_inference_row(
 
     lineup_player_features = build_lineup_player_features(
         custom_lineups,
-        historical_games,
         players,
-        historical_game_events,
-        historical_player_valuations,
-        historical_transfers,
+        player_events,
+        historical_valuation_history,
+        historical_transfer_history,
     )
     lineup_summary = aggregate_lineup_features(lineup_player_features)
 
@@ -1383,15 +1365,14 @@ def build_inference_row(
 def run_inference(
     model: Pipeline,
     feature_columns: list[str],
-    data_dir: Path,
     team_dim: pd.DataFrame,
     team_history: pd.DataFrame,
     manager_history: pd.DataFrame,
     club_event_history: pd.DataFrame,
     players: pd.DataFrame,
-    player_valuations: pd.DataFrame,
-    transfers: pd.DataFrame,
-    game_events: pd.DataFrame,
+    player_events: pd.DataFrame,
+    valuation_history: pd.DataFrame,
+    transfer_history: pd.DataFrame,
     games: pd.DataFrame,
     competition_scope: str,
     home_team_name: str,
@@ -1407,15 +1388,14 @@ def run_inference(
     output_dir: Path,
 ) -> dict[str, object]:
     home_inference_row, home_metadata = build_inference_row(
-        data_dir=data_dir,
         team_dim=team_dim,
         team_history=team_history,
         manager_history=manager_history,
         club_event_history=club_event_history,
         players=players,
-        player_valuations=player_valuations,
-        transfers=transfers,
-        game_events=game_events,
+        player_events=player_events,
+        valuation_history=valuation_history,
+        transfer_history=transfer_history,
         games=games,
         competition_scope=competition_scope,
         home_team_name=home_team_name,
@@ -1444,15 +1424,14 @@ def run_inference(
 
     if neutral_site:
         away_inference_row, away_metadata = build_inference_row(
-            data_dir=data_dir,
             team_dim=team_dim,
             team_history=team_history,
             manager_history=manager_history,
             club_event_history=club_event_history,
             players=players,
-            player_valuations=player_valuations,
-            transfers=transfers,
-            game_events=game_events,
+            player_events=player_events,
+            valuation_history=valuation_history,
+            transfer_history=transfer_history,
             games=games,
             competition_scope=competition_scope,
             home_team_name=away_team_name,
@@ -1528,9 +1507,8 @@ def validate_prediction_csv_row(
 ) -> list[str]:
     """validate a single prediction CSV row."""
     issues: list[str] = []
-    row_prefix = f"Row {index + 2}: "  # +2 for header and 1-based indexing
+    row_prefix = f"Row {index + 2}: "
     
-    # validate date
     as_of_date_text = str(row.get("prediction_date", "")).strip()
     if not as_of_date_text:
         issues.append(f"{row_prefix}prediction_date is required")
@@ -1539,7 +1517,6 @@ def validate_prediction_csv_row(
         if pd.isna(parsed_date):
             issues.append(f"{row_prefix}prediction_date is not a valid date format (YYYY-MM-DD)")
     
-    # validate team names
     home_team_name = str(row.get("home_team", "")).strip()
     away_team_name = str(row.get("away_team", "")).strip()
     
@@ -1563,26 +1540,22 @@ def validate_prediction_csv_row(
         elif len(find_team_matches(team_dim, away_team_name)) > 1:
             issues.append(f"{row_prefix}away_team '{away_team_name}' matches multiple teams (ambiguous)")
     
-    # validate manager names
     home_manager_name = str(row.get("home_manager", "")).strip() if pd.notna(row.get("home_manager")) else ""
     away_manager_name = str(row.get("away_manager", "")).strip() if pd.notna(row.get("away_manager")) else ""
     
     if home_manager_name and away_manager_name and normalize_name(home_manager_name) == normalize_name(away_manager_name):
         issues.append(f"{row_prefix}home_manager and away_manager must be different")
     
-    # parse lineups using CSV-aware parser
     home_starting = parse_csv_name_list(str(row.get("home_starting", "")))
     home_subs = parse_csv_name_list(str(row.get("home_subs", "")))
     away_starting = parse_csv_name_list(str(row.get("away_starting", "")))
     away_subs = parse_csv_name_list(str(row.get("away_subs", "")))
     
-    # validate starting lineup counts
     if len(home_starting) != 11:
         issues.append(f"{row_prefix}home_starting must contain exactly 11 players (got {len(home_starting)})")
     if len(away_starting) != 11:
         issues.append(f"{row_prefix}away_starting must contain exactly 11 players (got {len(away_starting)})")
     
-    # check for duplicates within team
     for label, values in [
         ("home_starting", home_starting),
         ("home_subs", home_subs),
@@ -1594,7 +1567,6 @@ def validate_prediction_csv_row(
         if duplicates:
             issues.append(f"{row_prefix}{label} contains duplicate players: {', '.join(duplicates)}")
     
-    # check for overlap between teams
     home_roster = {normalize_name(v) for v in home_starting + home_subs if normalize_name(v)}
     away_roster = {normalize_name(v) for v in away_starting + away_subs if normalize_name(v)}
     overlap = sorted(home_roster & away_roster)
@@ -1607,28 +1579,25 @@ def validate_prediction_csv_row(
 def run_batch_simulations(
     model: Pipeline,
     feature_columns: list[str],
-    data_dir: Path,
     team_dim: pd.DataFrame,
     team_history: pd.DataFrame,
     manager_history: pd.DataFrame,
     club_event_history: pd.DataFrame,
     players: pd.DataFrame,
-    player_valuations: pd.DataFrame,
-    transfers: pd.DataFrame,
-    game_events: pd.DataFrame,
+    player_events: pd.DataFrame,
+    valuation_history: pd.DataFrame,
+    transfer_history: pd.DataFrame,
     games: pd.DataFrame,
     competition_scope: str,
     prediction_csv: pd.DataFrame,
     simulation_runs: int,
     output_dir: Path,
 ) -> pd.DataFrame:
-    """run batch predictions with simulations for different lineup combinations."""
     results = []
     
     for idx, row in prediction_csv.iterrows():
         print(f"\nProcessing match {idx + 1}/{len(prediction_csv)}...")
         
-        # validate row
         validation_issues = validate_prediction_csv_row(row, team_dim, games, idx)
         if validation_issues:
             print(f"  Validation errors:")
@@ -1648,18 +1617,15 @@ def run_batch_simulations(
             away_starting = parse_csv_name_list(str(row["away_starting"]))
             away_subs = parse_csv_name_list(str(row["away_subs"]))
             
-            # run simulations with random lineup variations
             home_probs_list = []
             away_probs_list = []
             
             for sim in range(simulation_runs):
-                # shuffle substitutes within starting and subs to create variations
                 home_starting_var = home_starting.copy()
                 home_subs_var = home_subs.copy()
                 away_starting_var = away_starting.copy()
                 away_subs_var = away_subs.copy()
                 
-                # randomly swap some starters with subs to create different lineups
                 if home_subs_var:
                     swap_count = np.random.randint(0, min(3, len(home_subs_var)) + 1)
                     for _ in range(swap_count):
@@ -1674,17 +1640,15 @@ def run_batch_simulations(
                         sub_idx = np.random.randint(0, len(away_subs_var))
                         away_starting_var[starter_idx], away_subs_var[sub_idx] = away_subs_var[sub_idx], away_starting_var[starter_idx]
                 
-                # build and predict for this simulation
                 home_inference_row, _ = build_inference_row(
-                    data_dir=data_dir,
                     team_dim=team_dim,
                     team_history=team_history,
                     manager_history=manager_history,
                     club_event_history=club_event_history,
                     players=players,
-                    player_valuations=player_valuations,
-                    transfers=transfers,
-                    game_events=game_events,
+                    player_events=player_events,
+                    valuation_history=valuation_history,
+                    transfer_history=transfer_history,
                     games=games,
                     competition_scope=competition_scope,
                     home_team_name=home_team_name,
@@ -1701,17 +1665,15 @@ def run_batch_simulations(
                 home_probs = predict_match_probabilities(model, feature_columns, home_inference_row)
                 home_probs_list.append(home_probs)
                 
-                # also get away team perspective if we want neutral site
                 away_inference_row, _ = build_inference_row(
-                    data_dir=data_dir,
                     team_dim=team_dim,
                     team_history=team_history,
                     manager_history=manager_history,
                     club_event_history=club_event_history,
                     players=players,
-                    player_valuations=player_valuations,
-                    transfers=transfers,
-                    game_events=game_events,
+                    player_events=player_events,
+                    valuation_history=valuation_history,
+                    transfer_history=transfer_history,
                     games=games,
                     competition_scope=competition_scope,
                     home_team_name=away_team_name,
@@ -1731,10 +1693,8 @@ def run_batch_simulations(
                 if (sim + 1) % max(1, simulation_runs // 10) == 0:
                     print(f"  Completed {sim + 1}/{simulation_runs} simulations")
             
-            # average the probabilities
             avg_home_probs = np.mean(home_probs_list, axis=0)
             avg_away_probs = np.mean(away_probs_list, axis=0)
-            # align away probs to home perspective and average
             avg_away_probs_aligned = align_home_order_probabilities(avg_away_probs)
             final_probs = (avg_home_probs + avg_away_probs_aligned) / 2.0
             result = build_prediction_output_row(
@@ -1816,64 +1776,94 @@ def main() -> None:
             raise InputError("--min-test-games must be greater than 0")
         if args.n_estimators <= 0:
             raise InputError("--n-estimators must be greater than 0")
-        if not args.data_dir.exists():
-            raise InputError(f"Data directory does not exist: {args.data_dir}")
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        validate_required_csv_files(args.data_dir)
-
-        print("Loading datasets...")
-        games = load_csv(args.data_dir, "games.csv")
-        club_games = load_csv(args.data_dir, "club_games.csv")
-        clubs = load_csv(args.data_dir, "clubs.csv")
-        competitions = load_csv(args.data_dir, "competitions.csv")
-        countries = load_csv(args.data_dir, "countries.csv")
-        national_teams = load_csv(args.data_dir, "national_teams.csv")
-        players = load_csv(args.data_dir, "players.csv")
-        player_valuations = load_csv(args.data_dir, "player_valuations.csv")
-        transfers = load_csv(args.data_dir, "transfers.csv")
-        game_lineups = load_csv(args.data_dir, "game_lineups.csv")
-        game_events = load_csv(args.data_dir, "game_events.csv")
-        games["game_id"] = to_numeric_id(games["game_id"])
-        games["date"] = to_datetime(games["date"])
-        games["home_club_id"] = to_numeric_id(games["home_club_id"])
-        games["away_club_id"] = to_numeric_id(games["away_club_id"])
-        games["competition_type"] = games["competition_type"].fillna("unknown")
-        games["round"] = games["round"].fillna("unknown")
-
-        if args.competition_scope != "all":
-            games = games[games["competition_type"] == args.competition_scope].copy()
-
-        valid_game_ids = set(games["game_id"].dropna().astype(int).tolist())
-        club_games = club_games[to_numeric_id(club_games["game_id"]).isin(valid_game_ids)].copy()
-        game_lineups = game_lineups[to_numeric_id(game_lineups["game_id"]).isin(valid_game_ids)].copy()
-        game_events = game_events[to_numeric_id(game_events["game_id"]).isin(valid_game_ids)].copy()
-
-        print("Building team and manager histories...")
-        team_dim = normalize_team_dim(clubs, national_teams, competitions, countries)
-        team_history = build_team_history(club_games, games)
-        manager_history = build_manager_history(team_history)
-        club_event_history = build_club_event_history(game_events, games)
-
-        print("Building lineup and player profiles...")
-        lineup_player_features = build_lineup_player_features(game_lineups, games, players, game_events, player_valuations, transfers)
-        lineup_summary = aggregate_lineup_features(lineup_player_features)
-
-        print("Building match-level feature table...")
-        team_profile = build_team_profile(games, team_history, manager_history, club_event_history, lineup_summary, team_dim)
-        pair = build_diff_features(team_profile)
-
+        
         model_path = args.output_dir / "random_forest_model.joblib"
         features_path = args.output_dir / "feature_columns.json"
+        
+        artifacts = {
+            "team_dim": args.output_dir / "team_dim.pkl",
+            "team_history": args.output_dir / "team_history.pkl",
+            "manager_history": args.output_dir / "manager_history.pkl",
+            "club_event_history": args.output_dir / "club_event_history.pkl",
+            "player_events": args.output_dir / "player_events.pkl",
+            "valuation_history": args.output_dir / "valuation_history.pkl",
+            "transfer_history": args.output_dir / "transfer_history.pkl",
+            "players": args.output_dir / "players.pkl",
+            "games": args.output_dir / "games.pkl"
+        }
 
         if args.mode == "train":
+            if not args.data_dir.exists():
+                raise InputError(f"Data directory does not exist: {args.data_dir}")
+            validate_required_csv_files(args.data_dir)
+            
+            print("Loading raw datasets for training...")
+            games = load_csv(args.data_dir, "games.csv")
+            club_games = load_csv(args.data_dir, "club_games.csv")
+            clubs = load_csv(args.data_dir, "clubs.csv")
+            competitions = load_csv(args.data_dir, "competitions.csv")
+            countries = load_csv(args.data_dir, "countries.csv")
+            national_teams = load_csv(args.data_dir, "national_teams.csv")
+            players = load_csv(args.data_dir, "players.csv")
+            player_valuations = load_csv(args.data_dir, "player_valuations.csv")
+            transfers = load_csv(args.data_dir, "transfers.csv")
+            game_lineups = load_csv(args.data_dir, "game_lineups.csv")
+            game_events = load_csv(args.data_dir, "game_events.csv")
+            
+            games["game_id"] = to_numeric_id(games["game_id"])
+            games["date"] = to_datetime(games["date"])
+            games["home_club_id"] = to_numeric_id(games["home_club_id"])
+            games["away_club_id"] = to_numeric_id(games["away_club_id"])
+            games["competition_type"] = games["competition_type"].fillna("unknown")
+            games["round"] = games["round"].fillna("unknown")
+
+            if args.competition_scope != "all":
+                games = games[games["competition_type"] == args.competition_scope].copy()
+
+            valid_game_ids = set(games["game_id"].dropna().astype(int).tolist())
+            club_games = club_games[to_numeric_id(club_games["game_id"]).isin(valid_game_ids)].copy()
+            game_lineups = game_lineups[to_numeric_id(game_lineups["game_id"]).isin(valid_game_ids)].copy()
+            game_events = game_events[to_numeric_id(game_events["game_id"]).isin(valid_game_ids)].copy()
+
+            print("Building team and manager histories...")
+            team_dim = normalize_team_dim(clubs, national_teams, competitions, countries)
+            team_history = build_team_history(club_games, games)
+            manager_history = build_manager_history(team_history)
+            club_event_history = build_club_event_history(game_events, games)
+
+            print("Building lineup and player profiles...")
+            player_events = build_player_event_history(game_events, games)
+            valuation_history = build_valuation_history(player_valuations)
+            transfer_history = build_transfer_history(transfers)
+            
+            print("Saving processed profiles...")
+            team_dim.to_pickle(artifacts["team_dim"])
+            team_history.to_pickle(artifacts["team_history"])
+            manager_history.to_pickle(artifacts["manager_history"])
+            club_event_history.to_pickle(artifacts["club_event_history"])
+            player_events.to_pickle(artifacts["player_events"])
+            valuation_history.to_pickle(artifacts["valuation_history"])
+            transfer_history.to_pickle(artifacts["transfer_history"])
+            players.to_pickle(artifacts["players"])
+            games.to_pickle(artifacts["games"])
+
+            lineup_player_features = build_lineup_player_features(
+                game_lineups, players, player_events, valuation_history, transfer_history
+            )
+            lineup_summary = aggregate_lineup_features(lineup_player_features)
+
+            print("Building match-level feature table...")
+            team_profile = build_team_profile(games, team_history, manager_history, club_event_history, lineup_summary, team_dim)
+            pair = build_diff_features(team_profile)
+
             print("Splitting data by time and training RandomForest...")
             features, y, numeric_columns, categorical_columns = build_feature_matrix(pair)
             x_train, x_test, y_train, y_test, train_dates, test_dates = time_based_split(
                 features, y, pair["date"], args.test_fraction, args.min_test_games
             )
 
-            # فیلتر کردن مجموعه تست برای اینکه صرفا شامل بازی‌های ملی باشد
             if "competition_type" in x_test.columns:
                 national_mask = x_test["competition_type"] == "national_team_competition"
                 x_test = x_test.loc[national_mask]
@@ -1937,6 +1927,19 @@ def main() -> None:
             model = joblib.load(model_path)
             with open(features_path, "r", encoding="utf-8") as handle:
                 feature_cols_list = json.load(handle)
+                
+            try:
+                team_dim = pd.read_pickle(artifacts["team_dim"])
+                team_history = pd.read_pickle(artifacts["team_history"])
+                manager_history = pd.read_pickle(artifacts["manager_history"])
+                club_event_history = pd.read_pickle(artifacts["club_event_history"])
+                player_events = pd.read_pickle(artifacts["player_events"])
+                valuation_history = pd.read_pickle(artifacts["valuation_history"])
+                transfer_history = pd.read_pickle(artifacts["transfer_history"])
+                players = pd.read_pickle(artifacts["players"])
+                games = pd.read_pickle(artifacts["games"])
+            except FileNotFoundError as e:
+                raise InputError(f"Missing pre-computed profile: {e.filename}. Please run with '--mode train' first.")
 
         prediction_request = None
         prediction_args_present = any(
@@ -1976,22 +1979,21 @@ def main() -> None:
             batch_results = run_batch_simulations(
                 model=model,
                 feature_columns=feature_cols_list,
-                data_dir=args.data_dir,
                 team_dim=team_dim,
                 team_history=team_history,
                 manager_history=manager_history,
                 club_event_history=club_event_history,
                 players=players,
-                player_valuations=player_valuations,
-                transfers=transfers,
-                game_events=game_events,
+                player_events=player_events,
+                valuation_history=valuation_history,
+                transfer_history=transfer_history,
                 games=games,
                 competition_scope=args.competition_scope,
                 prediction_csv=prediction_csv,
                 simulation_runs=args.simulation_runs,
                 output_dir=args.output_dir,
             )
-            prediction_request = None  # Skip interactive inference
+            prediction_request = None
         elif sys.stdin.isatty():
             if prompt_yes_no("\nProcess batch predictions from CSV file? (y/n)", "n"):
                 csv_path_str = prompt_text("CSV file path", "sample_predictions.csv")
@@ -2002,15 +2004,14 @@ def main() -> None:
                     batch_results = run_batch_simulations(
                         model=model,
                         feature_columns=feature_cols_list,
-                        data_dir=args.data_dir,
                         team_dim=team_dim,
                         team_history=team_history,
                         manager_history=manager_history,
                         club_event_history=club_event_history,
                         players=players,
-                        player_valuations=player_valuations,
-                        transfers=transfers,
-                        game_events=game_events,
+                        player_events=player_events,
+                        valuation_history=valuation_history,
+                        transfer_history=transfer_history,
                         games=games,
                         competition_scope=args.competition_scope,
                         prediction_csv=prediction_csv,
@@ -2029,15 +2030,14 @@ def main() -> None:
             inference_result = run_inference(
                 model=model,
                 feature_columns=feature_cols_list,
-                data_dir=args.data_dir,
                 team_dim=team_dim,
                 team_history=team_history,
                 manager_history=manager_history,
                 club_event_history=club_event_history,
                 players=players,
-                player_valuations=player_valuations,
-                transfers=transfers,
-                game_events=game_events,
+                player_events=player_events,
+                valuation_history=valuation_history,
+                transfer_history=transfer_history,
                 games=games,
                 competition_scope=args.competition_scope,
                 home_team_name=prediction_request["home_team_name"],
