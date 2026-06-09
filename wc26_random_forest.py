@@ -189,8 +189,8 @@ def prompt_required_team_name(prompt: str, team_dim: pd.DataFrame) -> str:
             continue
         matches = find_team_matches(team_dim, team_name)
         if matches.empty:
-            print(f"Unknown team: {team_name}")
-            continue
+            print(f"Warning: Unknown team '{team_name}'. Will be treated as absolute zero.")
+            return team_name
         if len(matches) > 1:
             print(f"Team name is ambiguous: {team_name}")
             continue
@@ -280,16 +280,12 @@ def validate_prediction_request(
 
     if home_team_name:
         home_matches = find_team_matches(team_dim, home_team_name)
-        if home_matches.empty:
-            issues.append(f"Unknown home team: {home_team_name}")
-        elif len(home_matches) > 1:
+        if len(home_matches) > 1:
             issues.append(f"Home team name is ambiguous: {home_team_name}")
 
     if away_team_name:
         away_matches = find_team_matches(team_dim, away_team_name)
-        if away_matches.empty:
-            issues.append(f"Unknown away team: {away_team_name}")
-        elif len(away_matches) > 1:
+        if len(away_matches) > 1:
             issues.append(f"Away team name is ambiguous: {away_team_name}")
 
     if home_manager_name and away_manager_name and normalize_name(str(home_manager_name)) == normalize_name(str(away_manager_name)):
@@ -1209,9 +1205,9 @@ def build_prediction_output_row(
                 f"WIN {probabilities[2] * 100.0:.1f}% | "
                 f"DRAW {probabilities[1] * 100.0:.1f}% | "
                 f"LOSS {probabilities[0] * 100.0:.1f}% | "
-                f"Odds WIN {1 / probabilities[2]:.2f} | "
-                f"Odds DRAW {1 / probabilities[1]:.2f} | "
-                f"Odds LOSS {1 / probabilities[0]:.2f}"
+                f"Odds WIN {int(-100 * probabilities[2] / (1 - probabilities[2])) if probabilities[2] >= 0.5 else int(100 * (1 - probabilities[2]) / probabilities[2]):+d} | "
+                f"Odds DRAW {int(-100 * probabilities[1] / (1 - probabilities[1])) if probabilities[1] >= 0.5 else int(100 * (1 - probabilities[1]) / probabilities[1]):+d} | "
+                f"Odds LOSS {int(-100 * probabilities[0] / (1 - probabilities[0])) if probabilities[0] >= 0.5 else int(100 * (1 - probabilities[0]) / probabilities[0]):+d}"
             ),
         }
     )
@@ -1251,8 +1247,11 @@ def build_inference_row(
 
     home_team_id = resolve_team_id(team_dim, home_team_name)
     away_team_id = resolve_team_id(team_dim, away_team_name)
-    if pd.isna(home_team_id) or pd.isna(away_team_id):
-        raise InputError("Could not resolve one or both team names against the available datasets")
+
+    if pd.isna(home_team_id):
+        home_team_id = -999.0
+    if pd.isna(away_team_id):
+        away_team_id = -998.0
 
     historical_valuation_history = valuation_history[to_datetime(valuation_history["date"]).lt(as_of_date)].copy()
     historical_transfer_history = transfer_history[to_datetime(transfer_history["transfer_date"]).lt(as_of_date)].copy()
@@ -1277,10 +1276,23 @@ def build_inference_row(
     )
     lineup_summary = aggregate_lineup_features(lineup_player_features)
 
+    def create_zero_profile(df: pd.DataFrame, key_col: str, key_val: float | str) -> pd.DataFrame:
+        row = {}
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                row[col] = 0.0
+            else:
+                row[col] = "unknown"
+        row[key_col] = key_val
+        return pd.DataFrame([row])
+
     home_history = latest_row_before(team_history, "club_id", home_team_id, as_of_date)
     away_history = latest_row_before(team_history, "club_id", away_team_id, as_of_date)
-    if home_history.empty or away_history.empty:
-        raise InputError("Could not find enough historical team data for one of the selected teams")
+
+    if home_history.empty:
+        home_history = create_zero_profile(team_history, "club_id", home_team_id)
+    if away_history.empty:
+        away_history = create_zero_profile(team_history, "club_id", away_team_id)
 
     if home_manager_name:
         home_manager_history = latest_row_before(manager_history, "manager_name", home_manager_name, as_of_date)
@@ -1292,21 +1304,34 @@ def build_inference_row(
         away_manager_history = pd.DataFrame()
 
     if home_manager_history.empty:
-        home_manager_history = latest_row_before(manager_history, "manager_name", home_history.iloc[0].get("own_manager_name"), as_of_date)
+        mgr_name = home_manager_name if home_manager_name else home_history.iloc[0].get("own_manager_name", "unknown")
+        home_manager_history = latest_row_before(manager_history, "manager_name", mgr_name, as_of_date)
+        if home_manager_history.empty:
+            home_manager_history = create_zero_profile(manager_history, "manager_name", mgr_name)
+
     if away_manager_history.empty:
-        away_manager_history = latest_row_before(manager_history, "manager_name", away_history.iloc[0].get("own_manager_name"), as_of_date)
+        mgr_name = away_manager_name if away_manager_name else away_history.iloc[0].get("own_manager_name", "unknown")
+        away_manager_history = latest_row_before(manager_history, "manager_name", mgr_name, as_of_date)
+        if away_manager_history.empty:
+            away_manager_history = create_zero_profile(manager_history, "manager_name", mgr_name)
 
     home_events = latest_row_before(club_event_history, "club_id", home_team_id, as_of_date)
+    if home_events.empty:
+        home_events = create_zero_profile(club_event_history, "club_id", home_team_id)
+
     away_events = latest_row_before(club_event_history, "club_id", away_team_id, as_of_date)
+    if away_events.empty:
+        away_events = create_zero_profile(club_event_history, "club_id", away_team_id)
 
     home_lineup = lineup_summary[lineup_summary["club_id"].eq(home_team_id)].copy()
     away_lineup = lineup_summary[lineup_summary["club_id"].eq(away_team_id)].copy()
+    
     if home_lineup.empty:
-        home_lineup = pd.DataFrame([{column: np.nan for column in lineup_summary.columns}])
+        home_lineup = pd.DataFrame([{column: 0.0 if pd.api.types.is_numeric_dtype(lineup_summary[column]) else "unknown" for column in lineup_summary.columns}])
         home_lineup["club_id"] = home_team_id
         home_lineup["game_id"] = -1
     if away_lineup.empty:
-        away_lineup = pd.DataFrame([{column: np.nan for column in lineup_summary.columns}])
+        away_lineup = pd.DataFrame([{column: 0.0 if pd.api.types.is_numeric_dtype(lineup_summary[column]) else "unknown" for column in lineup_summary.columns}])
         away_lineup["club_id"] = away_team_id
         away_lineup["game_id"] = -1
 
@@ -1342,8 +1367,17 @@ def build_inference_row(
     home_lineup_profile = prefixed_single_row(home_lineup, "home_")
     away_lineup_profile = prefixed_single_row(away_lineup, "away_")
 
-    home_lookup = team_dim[team_dim["team_id"].eq(home_team_id)].tail(1).reset_index(drop=True).add_prefix("home_")
-    away_lookup = team_dim[team_dim["team_id"].eq(away_team_id)].tail(1).reset_index(drop=True).add_prefix("away_")
+    home_lookup = team_dim[team_dim["team_id"].eq(home_team_id)].tail(1).reset_index(drop=True)
+    if home_lookup.empty:
+        home_lookup = create_zero_profile(team_dim, "team_id", home_team_id)
+        home_lookup["team_name"] = home_team_name
+    home_lookup = home_lookup.add_prefix("home_")
+
+    away_lookup = team_dim[team_dim["team_id"].eq(away_team_id)].tail(1).reset_index(drop=True)
+    if away_lookup.empty:
+        away_lookup = create_zero_profile(team_dim, "team_id", away_team_id)
+        away_lookup["team_name"] = away_team_name
+    away_lookup = away_lookup.add_prefix("away_")
 
     inference_row = base
     for part in [home_profile, away_profile, home_manager_profile, away_manager_profile, home_event_profile, away_event_profile, home_lineup_profile, away_lineup_profile, home_lookup, away_lookup]:
@@ -1529,15 +1563,11 @@ def validate_prediction_csv_row(
         issues.append(f"{row_prefix}home_team and away_team must be different")
     
     if home_team_name:
-        if find_team_matches(team_dim, home_team_name).empty:
-            issues.append(f"{row_prefix}home_team '{home_team_name}' not found in database")
-        elif len(find_team_matches(team_dim, home_team_name)) > 1:
+        if len(find_team_matches(team_dim, home_team_name)) > 1:
             issues.append(f"{row_prefix}home_team '{home_team_name}' matches multiple teams (ambiguous)")
     
     if away_team_name:
-        if find_team_matches(team_dim, away_team_name).empty:
-            issues.append(f"{row_prefix}away_team '{away_team_name}' not found in database")
-        elif len(find_team_matches(team_dim, away_team_name)) > 1:
+        if len(find_team_matches(team_dim, away_team_name)) > 1:
             issues.append(f"{row_prefix}away_team '{away_team_name}' matches multiple teams (ambiguous)")
     
     home_manager_name = str(row.get("home_manager", "")).strip() if pd.notna(row.get("home_manager")) else ""
