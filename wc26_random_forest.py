@@ -1894,12 +1894,8 @@ def main() -> None:
                 features, y, pair["date"], args.test_fraction, args.min_test_games
             )
 
-            if "competition_type" in x_test.columns:
-                national_mask = x_test["competition_type"] == "national_team_competition"
-                x_test = x_test.loc[national_mask]
-                y_test = y_test.loc[national_mask]
-                test_dates = test_dates.loc[national_mask]
-
+            # The model uses all available competition types by default, matching the default
+            # `--competition-scope=all` behavior. No national-team-only filter is applied here.
             model = build_model(numeric_columns, categorical_columns, args.n_estimators, args.random_state)
             model.fit(x_train, y_train)
 
