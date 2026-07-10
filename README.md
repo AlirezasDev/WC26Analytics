@@ -1,4 +1,4 @@
-# WC26 Analytics - Random Forest Match Prediction Model
+# WC26 Analytics
 
 ## Project Overview
 
