@@ -1,0 +1,34 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# CatBoost & Temporary Training Logs
+catboost_info/
+*.log
+
+# Raw Datasets (Exceeding GitHub 100MB limits or raw data)
+*.csv
+!sample_predictions.csv
+!src/sample_predictions.csv
+!artifacts/*.csv
+*.xlsx
+
+# Binary Model Checkpoints & Large Caches (> 100MB GitHub limit)
+*.joblib
+*.pkl
+artifacts/*.joblib
+artifacts/*.pkl
+!artifacts/evaluation_metrics.json
+!artifacts/feature_columns.json
+!artifacts/wc26_group_stage_evaluation.csv
+!artifacts/batch_predictions_results.csv
+
+# IDE & OS Metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
