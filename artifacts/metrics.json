@@ -1,0 +1,42 @@
+{
+  "accuracy": 0.5933333333333334,
+  "log_loss": 0.9137789895511813,
+  "roc_auc_ovr_macro": 0.733249863828879,
+  "train_size": 520,
+  "test_size": 150,
+  "train_last_date": "2024-01-25",
+  "test_first_date": "2024-01-28",
+  "classification_report": {
+    "loss": {
+      "precision": 0.5396825396825397,
+      "recall": 0.6666666666666666,
+      "f1-score": 0.5964912280701754,
+      "support": 51.0
+    },
+    "draw": {
+      "precision": 0.3333333333333333,
+      "recall": 0.10344827586206896,
+      "f1-score": 0.15789473684210525,
+      "support": 29.0
+    },
+    "win": {
+      "precision": 0.6666666666666666,
+      "recall": 0.7428571428571429,
+      "f1-score": 0.7027027027027027,
+      "support": 70.0
+    },
+    "accuracy": 0.5933333333333334,
+    "macro avg": {
+      "precision": 0.5132275132275131,
+      "recall": 0.5043240284619595,
+      "f1-score": 0.48569622253832784,
+      "support": 150.0
+    },
+    "weighted avg": {
+      "precision": 0.5590476190476191,
+      "recall": 0.5933333333333334,
+      "f1-score": 0.5612612612612613,
+      "support": 150.0
+    }
+  }
+}
