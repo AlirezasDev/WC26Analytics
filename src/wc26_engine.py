@@ -30,6 +30,8 @@ from elo_poisson import (
 )
 from match_intelligence import (
     compute_full_match_markets,
+    compute_scorers_from_live_roster,
+    compute_live_league_profile_from_standings,
     get_intelligence_store,
 )
 from player_profiler import (
@@ -408,19 +410,19 @@ def analyze_match_deep(
     momentum_shift: float = 0.0,
     elo_override_home: float | None = None,
     elo_override_away: float | None = None,
+    live_context: dict | None = None,
 ) -> dict:
     """
     Comprehensive sportsbook-grade match intelligence engine:
-    1. Runs 192-feature ML Ensemble (symmetrically calibrated if neutral) when teams exist in dataset,
-       or dynamic Elo + Dixon-Coles fallback for external clubs.
+    1. Runs 192-feature ML Ensemble (symmetrically calibrated if neutral) blended with live current-season
+       table Elo and scoring/conceding rates when live_context is provided.
     2. Conditions joint goal matrix on live in-play state (minute, score, red cards, momentum).
-    3. Computes 50+ granular analytical markets (1X2, DC, DNB, O/U 0.5-5.5, Team Totals, BTTS,
-       Asian/Euro Handicaps, 1H/2H, HT/FT, Exact Score Matrix, Corners, Cards, Shots).
-    4. Attaches historical H2H, Overall/Home/Away Form Splits, 15-Minute Goal Timing, Club Profiles,
-       and Key Players with Anytime Goalscorer probabilities.
+    3. Computes 50+ granular analytical markets.
+    4. Prioritizes live-scraped current-season active rosters, injuries, and 2026-27 match form over static CSVs.
     """
     resolved_data_dir = (data_dir or artifacts_dir.parent).resolve()
     intel_store = get_intelligence_store(resolved_data_dir)
+    live_ctx = live_context or {}
 
     used_ensemble = False
     h_id, a_id = None, None
@@ -450,22 +452,39 @@ def analyze_match_deep(
             canon_h, canon_a = r1["home_team"], r1["away_team"]
         used_ensemble = True
     except Exception:
-        h_elo = float(elo_override_home or 1680.0)
-        a_elo = float(elo_override_away or 1680.0)
+        h_elo = float(elo_override_home or 1750.0)
+        a_elo = float(elo_override_away or 1750.0)
         adv = 0.0 if is_neutral else 60.0
         diff = (h_elo - a_elo) + adv
         lam_h = float(np.clip(1.35 + (diff / 500.0), 0.25, 4.2))
         lam_a = float(np.clip(1.15 - (diff / 500.0), 0.25, 4.2))
         p_win, p_draw, p_loss = calculate_dixon_coles_probs(lam_h, lam_a)
 
-    # Historical dossiers when team IDs exist
+    # Blend live current-season Elo and live 2026-27 GF/GA form when available
+    if elo_override_home is not None:
+        h_elo = round(0.55 * float(elo_override_home) + 0.45 * h_elo, 1) if used_ensemble else float(elo_override_home)
+    if elo_override_away is not None:
+        a_elo = round(0.55 * float(elo_override_away) + 0.45 * a_elo, 1) if used_ensemble else float(elo_override_away)
+
+    live_hf = live_ctx.get("home_overall_form")
+    live_af = live_ctx.get("away_overall_form")
+    if live_hf and live_af and live_hf.get("played", 0) >= 3 and live_af.get("played", 0) >= 3:
+        live_lam_h = (float(live_hf["avg_gf"]) + float(live_af["avg_ga"])) / 2.0 * (1.0 if is_neutral else 1.07)
+        live_lam_a = (float(live_af["avg_gf"]) + float(live_hf["avg_ga"])) / 2.0 * (1.0 if is_neutral else 0.93)
+        lam_h = float(np.clip(0.55 * live_lam_h + 0.45 * lam_h, 0.25, 4.3))
+        lam_a = float(np.clip(0.55 * live_lam_a + 0.45 * lam_a, 0.25, 4.3))
+        lw, ld, ll = calculate_dixon_coles_probs(lam_h, lam_a)
+        p_win = 0.55 * lw + 0.45 * p_win
+        p_draw = 0.55 * ld + 0.45 * p_draw
+        p_loss = 0.55 * ll + 0.45 * p_loss
+
     home_timing = intel_store.get_goal_timing_and_cards(h_id) if h_id is not None else intel_store.get_goal_timing_and_cards(-1)
     away_timing = intel_store.get_goal_timing_and_cards(a_id) if a_id is not None else intel_store.get_goal_timing_and_cards(-1)
 
     score_mat = build_calibrated_score_matrix(
         lambda_h=lam_h,
         lambda_a=lam_a,
-        target_probs=(p_win, p_draw, p_loss) if used_ensemble else None,
+        target_probs=(p_win, p_draw, p_loss),
         minute=minute,
         current_hg=current_hg,
         current_ag=current_ag,
@@ -485,18 +504,49 @@ def analyze_match_deep(
         expected_cards_away=away_timing["avg_yellow_cards"],
     )
 
+    # Resolve key players strictly from live current-season active roster if scraped
+    live_h_roster = live_ctx.get("home_roster")
+    live_a_roster = live_ctx.get("away_roster")
+    if live_h_roster is not None:
+        h_key_players = compute_scorers_from_live_roster(live_h_roster, team_expected_goals=lam_h)
+    else:
+        h_key_players = intel_store.get_key_players(h_id, team_expected_goals=lam_h) if h_id is not None else []
+
+    if live_a_roster is not None:
+        a_key_players = compute_scorers_from_live_roster(live_a_roster, team_expected_goals=lam_a)
+    else:
+        a_key_players = intel_store.get_key_players(a_id, team_expected_goals=lam_a) if a_id is not None else []
+
+    # Merge any live current-season H2H meetings onto historical H2H
+    base_h2h = intel_store.get_head_to_head(h_id, a_id) if (h_id is not None and a_id is not None) else {
+        "total_matches": 0, "home_team_wins": 0, "draws": 0, "away_team_wins": 0,
+        "avg_total_goals": 0.0, "btts_pct": 0.0, "over_2_5_pct": 0.0, "matches": []
+    }
+    live_h2h_list = live_ctx.get("live_h2h_matches") or []
+    if live_h2h_list:
+        seen_dates = {m["date"] for m in base_h2h.get("matches", [])}
+        new_h2h = [m for m in live_h2h_list if m["date"] not in seen_dates]
+        if new_h2h:
+            base_h2h["matches"] = (new_h2h + base_h2h.get("matches", []))[:12]
+            base_h2h["total_matches"] = int(base_h2h.get("total_matches", 0)) + len(new_h2h)
+
+    h_prof = live_ctx.get("home_profile") or (intel_store.get_club_profile(h_id, canon_h) if h_id is not None else {"name": canon_h})
+    a_prof = live_ctx.get("away_profile") or (intel_store.get_club_profile(a_id, canon_a) if a_id is not None else {"name": canon_a})
+
     dossier = {
-        "home_profile": intel_store.get_club_profile(h_id, canon_h) if h_id is not None else {"name": canon_h},
-        "away_profile": intel_store.get_club_profile(a_id, canon_a) if a_id is not None else {"name": canon_a},
-        "h2h": intel_store.get_head_to_head(h_id, a_id) if (h_id is not None and a_id is not None) else {"total_matches": 0, "matches": []},
-        "home_overall_form": intel_store.get_team_recent_form(h_id, n=10) if h_id is not None else {"matches": [], "form_sequence": []},
-        "away_overall_form": intel_store.get_team_recent_form(a_id, n=10) if a_id is not None else {"matches": [], "form_sequence": []},
-        "home_venue_form": intel_store.get_team_recent_form(h_id, n=5, venue_filter="home") if h_id is not None else {"matches": [], "form_sequence": []},
-        "away_venue_form": intel_store.get_team_recent_form(a_id, n=5, venue_filter="away") if a_id is not None else {"matches": [], "form_sequence": []},
+        "home_profile": h_prof,
+        "away_profile": a_prof,
+        "h2h": base_h2h,
+        "home_overall_form": live_hf or (intel_store.get_team_recent_form(h_id, n=10) if h_id is not None else {"matches": [], "form_sequence": []}),
+        "away_overall_form": live_af or (intel_store.get_team_recent_form(a_id, n=10) if a_id is not None else {"matches": [], "form_sequence": []}),
+        "home_venue_form": live_ctx.get("home_venue_form") or (intel_store.get_team_recent_form(h_id, n=5, venue_filter="home") if h_id is not None else {"matches": [], "form_sequence": []}),
+        "away_venue_form": live_ctx.get("away_venue_form") or (intel_store.get_team_recent_form(a_id, n=5, venue_filter="away") if a_id is not None else {"matches": [], "form_sequence": []}),
         "home_goal_timing": home_timing,
         "away_goal_timing": away_timing,
-        "home_key_players": intel_store.get_key_players(h_id, team_expected_goals=lam_h) if h_id is not None else [],
-        "away_key_players": intel_store.get_key_players(a_id, team_expected_goals=lam_a) if a_id is not None else [],
+        "home_key_players": h_key_players,
+        "away_key_players": a_key_players,
+        "home_injuries": live_ctx.get("home_injuries") or [],
+        "away_injuries": live_ctx.get("away_injuries") or [],
     }
 
     return {

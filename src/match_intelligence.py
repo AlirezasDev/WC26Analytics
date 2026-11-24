@@ -810,6 +810,157 @@ class HistoricalIntelligenceStore:
         }
 
 
+def compute_scorers_from_live_roster(
+    live_roster: list[dict[str, Any]],
+    team_expected_goals: float = 1.35,
+    top_n: int = 8,
+) -> list[dict[str, Any]]:
+    """
+    Compute Anytime Goalscorer and 2+ Goals (Brace) probabilities & odds directly
+    from a club's live-scraped current-season active roster (excluding injured players).
+    """
+    if not live_roster:
+        return []
+
+    healthy = [p for p in live_roster if not p.get("is_injured")]
+    if not healthy:
+        healthy = live_roster
+
+    # Weight scoring share by current-season goals, shots on target, and attacking role
+    scored_candidates = []
+    for p in healthy:
+        role = str(p.get("role") or p.get("position") or "").lower()
+        if "goal" in role or role == "gk" or role == "g":
+            continue
+        goals = float(p.get("goals") or 0.0)
+        assists = float(p.get("assists") or 0.0)
+        sot = float(p.get("shots_on_target") or 0.0)
+        shots = float(p.get("shots") or 0.0)
+        apps = float(p.get("apps") or 0.0)
+
+        role_prior = 1.45 if ("forward" in role or role == "f") else (0.75 if ("mid" in role or role == "m") else 0.22)
+        raw_weight = (goals * 3.4) + (sot * 0.55) + (shots * 0.15) + (assists * 0.45) + role_prior * (1.0 + min(apps, 10.0) * 0.08)
+        scored_candidates.append((raw_weight, p))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+    top_pool = scored_candidates[:14]
+    total_w = max(4.5, sum(w for w, _ in top_pool) * 1.18)
+
+    out = []
+    for w, p in top_pool[:top_n]:
+        share = float(np.clip(w / total_w, 0.025, 0.46))
+        lam_i = max(0.015, float(team_expected_goals) * share)
+        prob_anytime = 1.0 - float(np.exp(-lam_i))
+        prob_brace = 1.0 - float(np.exp(-lam_i) * (1.0 + lam_i))
+        out.append(
+            {
+                "player_id": int(p.get("player_id") or 0),
+                "name": str(p.get("name") or ""),
+                "jersey": int(p.get("jersey") or 0),
+                "age": int(p.get("age") or 0),
+                "position": str(p.get("position") or p.get("role") or ""),
+                "apps": int(p.get("apps") or 0),
+                "goals": int(p.get("goals") or 0),
+                "assists": int(p.get("assists") or 0),
+                "shots": int(p.get("shots") or 0),
+                "shots_on_target": int(p.get("shots_on_target") or 0),
+                "anytime_scorer": _fmt_market_outcome(prob_anytime),
+                "brace_scorer": _fmt_market_outcome(prob_brace),
+            }
+        )
+    return out
+
+
+def compute_live_league_profile_from_standings(
+    standings_rows: list[dict[str, Any]],
+    recent_fixtures: list[dict[str, Any]] | None = None,
+    base_elo: float = 1860.0,
+) -> dict[str, Any]:
+    """
+    Compute 100% up-to-date current-season league analytical metrics and club power rankings
+    directly from live-scraped current-season standings and completed matches.
+    """
+    if not standings_rows:
+        return {"analytical_profile": {}, "clubs": []}
+
+    tot_team_games = sum(int(r.get("played") or 0) for r in standings_rows)
+    tot_matches = max(1, tot_team_games // 2)
+    tot_goals = sum(int(r.get("gf") or 0) for r in standings_rows)
+    tot_draws = sum(int(r.get("drawn") or 0) for r in standings_rows) // 2
+
+    avg_goals = round(tot_goals / tot_matches, 2)
+    draw_pct = round((tot_draws / tot_matches) * 100.0, 1)
+    rem_win_pct = max(0.0, 100.0 - draw_pct)
+
+    # Check completed recent fixtures if available, else derive accurately from Poisson mean avg_goals
+    fin = [
+        f for f in (recent_fixtures or [])
+        if f.get("status") == "FINISHED"
+    ]
+    if len(fin) >= 6:
+        hw = sum(1 for f in fin if int(f.get("homeScore", 0)) > int(f.get("awayScore", 0)))
+        aw = sum(1 for f in fin if int(f.get("awayScore", 0)) > int(f.get("homeScore", 0)))
+        hw_ratio = hw / max(1, hw + aw)
+        home_win_pct = round(rem_win_pct * hw_ratio, 1)
+        away_win_pct = round(100.0 - draw_pct - home_win_pct, 1)
+        btts_pct = round(
+            (sum(1 for f in fin if int(f.get("homeScore", 0)) >= 1 and int(f.get("awayScore", 0)) >= 1) / len(fin)) * 100.0,
+            1,
+        )
+        o25_pct = round(
+            (sum(1 for f in fin if (int(f.get("homeScore", 0)) + int(f.get("awayScore", 0))) >= 3) / len(fin)) * 100.0,
+            1,
+        )
+    else:
+        home_win_pct = round(rem_win_pct * 0.575, 1)
+        away_win_pct = round(100.0 - draw_pct - home_win_pct, 1)
+        lam_h = avg_goals * 0.545
+        lam_a = avg_goals * 0.455
+        btts_pct = round((1.0 - np.exp(-lam_h)) * (1.0 - np.exp(-lam_a)) * 100.0, 1)
+        o25_pct = round((1.0 - float(poisson.cdf(2, max(0.5, avg_goals)))) * 100.0, 1)
+
+    n_teams = len(standings_rows)
+    clubs_live = []
+    for r in standings_rows:
+        played = max(1, int(r.get("played") or 1))
+        pts = int(r.get("points") or 0)
+        gf = int(r.get("gf") or 0)
+        ga = int(r.get("ga") or 0)
+        gd = int(r.get("gd") or (gf - ga))
+        rank = int(r.get("rank") or 1)
+        ppg = round(pts / played, 2)
+        gf_pg = round(gf / played, 2)
+        ga_pg = round(ga / played, 2)
+        live_elo = round(base_elo + (ppg - 1.38) * 115.0 + ((gd / played) * 38.0) + ((n_teams / 2.0 - rank) * 4.5), 1)
+        clubs_live.append(
+            {
+                "rank": rank,
+                "name": str(r.get("teamName") or r.get("teamNameEn") or ""),
+                "name_en": str(r.get("teamNameEn") or r.get("teamName") or ""),
+                "played": played,
+                "points": pts,
+                "ppg": ppg,
+                "gf_per_game": gf_pg,
+                "ga_per_game": ga_pg,
+                "elo": live_elo,
+            }
+        )
+    clubs_live.sort(key=lambda x: x["elo"], reverse=True)
+
+    return {
+        "analytical_profile": {
+            "avg_goals_per_match": avg_goals,
+            "home_win_pct": home_win_pct,
+            "draw_pct": draw_pct,
+            "away_win_pct": away_win_pct,
+            "btts_pct": btts_pct,
+            "over_2_5_pct": o25_pct,
+            "matches_played_season": tot_matches,
+        },
+        "clubs": clubs_live,
+    }
+
+
 _GLOBAL_INTEL_STORE: HistoricalIntelligenceStore | None = None
 
 
