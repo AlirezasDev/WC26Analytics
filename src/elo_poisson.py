@@ -53,6 +53,93 @@ def calculate_dixon_coles_probs(lambda_h: float, lambda_a: float, rho: float = -
     return p_win, p_draw, p_loss
 
 
+def build_calibrated_score_matrix(
+    lambda_h: float,
+    lambda_a: float,
+    target_probs: tuple[float, float, float] | None = None,
+    minute: int = 0,
+    current_hg: int = 0,
+    current_ag: int = 0,
+    red_cards_h: int = 0,
+    red_cards_a: int = 0,
+    momentum_shift: float = 0.0,
+    rho: float = -0.06,
+    max_goals: int = 9,
+) -> np.ndarray:
+    """
+    Build a calibrated (max_goals+1) x (max_goals+1) joint goal probability matrix P(G_home=i, G_away=j).
+    - Pre-match (minute == 0): Applies Dixon-Coles bivariate Poisson and iterative proportional
+      scaling against the ML ensemble's (p_win, p_draw, p_loss) probabilities when provided.
+    - Live in-play (minute > 0): Conditions strictly on already-scored goals (current_hg, current_ag),
+      remaining match time fraction, red-card manpower penalties, and live attacking momentum.
+    """
+    minute = int(max(0, min(95, minute)))
+    rem_fraction = 1.0 if minute <= 0 else max(0.02, (93.0 - minute) / 93.0)
+
+    # Red card and live momentum multipliers on remaining scoring intensity
+    rc_mult_h = (0.72 ** max(0, red_cards_h)) * (1.14 ** max(0, red_cards_a))
+    rc_mult_a = (0.72 ** max(0, red_cards_a)) * (1.14 ** max(0, red_cards_h))
+    mom_mult_h = float(np.clip(1.0 + 0.18 * momentum_shift, 0.75, 1.30))
+    mom_mult_a = float(np.clip(1.0 - 0.18 * momentum_shift, 0.75, 1.30))
+
+    rem_lh = max(0.01, float(lambda_h) * rem_fraction * rc_mult_h * mom_mult_h)
+    rem_la = max(0.01, float(lambda_a) * rem_fraction * rc_mult_a * mom_mult_a)
+
+    rem_goals = np.arange(max_goals + 1)
+    ph = poisson.pmf(rem_goals, rem_lh)
+    pa = poisson.pmf(rem_goals, rem_la)
+    rem_mat = np.outer(ph, pa)
+
+    if minute == 0:
+        rem_mat[0, 0] *= max(0.0, 1.0 - rem_lh * rem_la * rho)
+        rem_mat[0, 1] *= max(0.0, 1.0 + rem_lh * rho)
+        rem_mat[1, 0] *= max(0.0, 1.0 + rem_la * rho)
+        rem_mat[1, 1] *= max(0.0, 1.0 - rho)
+
+    s = rem_mat.sum()
+    if s > 0:
+        rem_mat /= s
+
+    # Shift matrix by current_hg and current_ag for live in-play matches
+    full_mat = np.zeros((max_goals + 1, max_goals + 1), dtype=float)
+    for rh in range(max_goals + 1):
+        for ra in range(max_goals + 1):
+            fh = min(max_goals, current_hg + rh)
+            fa = min(max_goals, current_ag + ra)
+            full_mat[fh, fa] += rem_mat[rh, ra]
+
+    # Pre-match calibration toward ML ensemble 1X2 probabilities (soft blend to keep smooth score distribution)
+    if minute == 0 and target_probs is not None:
+        tw, td, tl = target_probs
+        tsum = tw + td + tl
+        if tsum > 0:
+            tw, td, tl = tw / tsum, td / tsum, tl / tsum
+            mw = float(np.sum(np.tril(full_mat, -1)))
+            md = float(np.sum(np.diag(full_mat)))
+            ml = float(np.sum(np.triu(full_mat, 1)))
+            # Blend 70% ML Ensemble + 30% Dixon-Coles structural prior so draw/tail scores stay realistic
+            bw = 0.70 * tw + 0.30 * mw
+            bd = 0.70 * td + 0.30 * md
+            bl = 0.70 * tl + 0.30 * ml
+
+            win_mask = np.tril(np.ones_like(full_mat, dtype=bool), -1)
+            draw_mask = np.eye(max_goals + 1, dtype=bool)
+            loss_mask = np.triu(np.ones_like(full_mat, dtype=bool), 1)
+
+            if mw > 1e-6:
+                full_mat[win_mask] *= bw / mw
+            if md > 1e-6:
+                full_mat[draw_mask] *= bd / md
+            if ml > 1e-6:
+                full_mat[loss_mask] *= bl / ml
+
+            tot = full_mat.sum()
+            if tot > 0:
+                full_mat /= tot
+
+    return full_mat
+
+
 def calculate_dynamic_elo(games: pd.DataFrame, national_teams: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict[float, float]]:
     """
     Calculate dynamic Elo ratings chronologically across all 88k+ matches.

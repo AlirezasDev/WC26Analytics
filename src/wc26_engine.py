@@ -26,6 +26,11 @@ from elo_poisson import (
     calculate_dynamic_elo,
     compute_poisson_features,
     calculate_dixon_coles_probs,
+    build_calibrated_score_matrix,
+)
+from match_intelligence import (
+    compute_full_match_markets,
+    get_intelligence_store,
 )
 from player_profiler import (
     build_valuation_history,
@@ -212,6 +217,23 @@ def run_training(data_dir: Path, artifacts_dir: Path, force_rebuild: bool = Fals
     return metrics, eval_df
 
 
+_MEMORY_CACHE: dict[str, tuple] = {}
+
+
+def _load_cached_bundle(artifacts_dir: Path):
+    key = str(artifacts_dir.resolve())
+    if key in _MEMORY_CACHE:
+        return _MEMORY_CACHE[key]
+    pipeline, num_cols, cat_cols = load_artifacts(artifacts_dir)
+    meta_path = artifacts_dir / METADATA_FILENAME
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Metadata file {meta_path} missing. Run --mode train first.")
+    meta = joblib.load(meta_path)
+    bundle = (pipeline, num_cols, cat_cols, meta)
+    _MEMORY_CACHE[key] = bundle
+    return bundle
+
+
 def predict_match(
     home_name: str,
     away_name: str,
@@ -220,14 +242,9 @@ def predict_match(
     match_date: str = "2026-06-15",
 ):
     """
-    Generate Win / Draw / Loss probabilities and full Betting Odds for any matchup.
+    Generate Win / Draw / Loss probabilities and full Betting Odds for any club or national team matchup.
     """
-    pipeline, num_cols, cat_cols = load_artifacts(artifacts_dir)
-    meta_path = artifacts_dir / METADATA_FILENAME
-    if not meta_path.is_file():
-        raise FileNotFoundError(f"Metadata file {meta_path} missing. Run --mode train first.")
-        
-    meta = joblib.load(meta_path)
+    pipeline, num_cols, cat_cols, meta = _load_cached_bundle(artifacts_dir)
     team_dim = meta["team_dim"]
     elo_dict = meta["elo_dict"]
     latest_team = meta["latest_team_hist"]
@@ -245,21 +262,35 @@ def predict_match(
     h_id = float(h_id)
     a_id = float(a_id)
 
+    h_dim = team_dim[team_dim["team_id"] == h_id]
+    a_dim = team_dim[team_dim["team_id"] == a_id]
+    h_kind = h_dim.iloc[0].get("team_kind", "national_team") if not h_dim.empty else "national_team"
+    a_kind = a_dim.iloc[0].get("team_kind", "national_team") if not a_dim.empty else "national_team"
+    h_country = h_dim.iloc[0].get("team_country_name", "") if not h_dim.empty else ""
+    a_country = a_dim.iloc[0].get("team_country_name", "") if not a_dim.empty else ""
+    canon_h_name = str(h_dim.iloc[0].get("team_name") or home_name.title()) if not h_dim.empty else home_name.title()
+    canon_a_name = str(a_dim.iloc[0].get("team_name") or away_name.title()) if not a_dim.empty else away_name.title()
+
+    if h_kind == "club" and a_kind == "club":
+        comp_type = "domestic_league" if (h_country and h_country == a_country and not is_neutral) else "international_cup"
+    else:
+        comp_type = "national_team_competition"
+
     # Elo & Poisson
-    h_elo = elo_dict.get(h_id, 1500.0)
-    a_elo = elo_dict.get(a_id, 1500.0)
+    h_elo = float(elo_dict.get(h_id, 1500.0))
+    a_elo = float(elo_dict.get(a_id, 1500.0))
     home_adv = 0.0 if is_neutral else 65.0
     diff_elo = (h_elo - a_elo) + home_adv
     ratio_elo = h_elo / max(1.0, a_elo)
 
-    lambda_home = np.clip(1.35 + (diff_elo / 500.0), 0.2, 4.5)
-    lambda_away = np.clip(1.15 - (diff_elo / 500.0), 0.2, 4.5)
+    lambda_home = float(np.clip(1.35 + (diff_elo / 500.0), 0.2, 4.5))
+    lambda_away = float(np.clip(1.15 - (diff_elo / 500.0), 0.2, 4.5))
     pw, pd_val, pl = calculate_dixon_coles_probs(lambda_home, lambda_away)
 
     # Base match row
     row = {
         "date": match_date,
-        "competition_type": "national_team_competition",
+        "competition_type": comp_type,
         "home_club_id": h_id,
         "away_club_id": a_id,
         "home_elo_before": h_elo,
@@ -314,28 +345,14 @@ def predict_match(
             if c not in ["game_id", "club_id"]:
                 row[f"away_{c}"] = a_sq.iloc[0][c]
 
-    # Team dimension lookups
-    h_dim = team_dim[team_dim["team_id"] == h_id]
-    if not h_dim.empty:
-        row["home_team_kind"] = h_dim.iloc[0].get("team_kind", "national_team")
-        row["home_team_confederation"] = h_dim.iloc[0].get("team_confederation", "unknown")
-    else:
-        row["home_team_kind"] = "national_team"
-        row["home_team_confederation"] = "unknown"
-
-    a_dim = team_dim[team_dim["team_id"] == a_id]
-    if not a_dim.empty:
-        row["away_team_kind"] = a_dim.iloc[0].get("team_kind", "national_team")
-        row["away_team_confederation"] = a_dim.iloc[0].get("team_confederation", "unknown")
-    else:
-        row["away_team_kind"] = "national_team"
-        row["away_team_confederation"] = "unknown"
+    row["home_team_kind"] = h_kind
+    row["home_team_confederation"] = h_dim.iloc[0].get("team_confederation", "unknown") if not h_dim.empty else "unknown"
+    row["away_team_kind"] = a_kind
+    row["away_team_confederation"] = a_dim.iloc[0].get("team_confederation", "unknown") if not a_dim.empty else "unknown"
 
     df_row = pd.DataFrame([row])
-    # Build differential and ratio features
     df_row = build_diff_features(df_row)
 
-    # Ensure all expected columns exist
     for col in num_cols:
         if col not in df_row.columns:
             df_row[col] = np.nan
@@ -346,11 +363,14 @@ def predict_match(
     inference_features = df_row[num_cols + cat_cols]
     y_prob = pipeline.predict_proba(inference_features)[0]
 
-    p_loss, p_draw, p_win = y_prob[0], y_prob[1], y_prob[2]
+    p_loss, p_draw, p_win = float(y_prob[0]), float(y_prob[1]), float(y_prob[2])
 
-    result = {
-        "home_team": home_name.title(),
-        "away_team": away_name.title(),
+    return {
+        "home_team_id": int(h_id),
+        "away_team_id": int(a_id),
+        "home_team": canon_h_name,
+        "away_team": canon_a_name,
+        "competition_type": comp_type,
         "home_elo": round(h_elo, 1),
         "away_elo": round(a_elo, 1),
         "expected_goals_home": round(lambda_home, 2),
@@ -372,7 +392,154 @@ def predict_match(
         },
     }
 
-    return result
+
+def analyze_match_deep(
+    home_name: str,
+    away_name: str,
+    artifacts_dir: Path,
+    data_dir: Path | None = None,
+    is_neutral: bool = False,
+    match_date: str = "2026-11-24",
+    minute: int = 0,
+    current_hg: int = 0,
+    current_ag: int = 0,
+    red_cards_h: int = 0,
+    red_cards_a: int = 0,
+    momentum_shift: float = 0.0,
+    elo_override_home: float | None = None,
+    elo_override_away: float | None = None,
+) -> dict:
+    """
+    Comprehensive sportsbook-grade match intelligence engine:
+    1. Runs 192-feature ML Ensemble (symmetrically calibrated if neutral) when teams exist in dataset,
+       or dynamic Elo + Dixon-Coles fallback for external clubs.
+    2. Conditions joint goal matrix on live in-play state (minute, score, red cards, momentum).
+    3. Computes 50+ granular analytical markets (1X2, DC, DNB, O/U 0.5-5.5, Team Totals, BTTS,
+       Asian/Euro Handicaps, 1H/2H, HT/FT, Exact Score Matrix, Corners, Cards, Shots).
+    4. Attaches historical H2H, Overall/Home/Away Form Splits, 15-Minute Goal Timing, Club Profiles,
+       and Key Players with Anytime Goalscorer probabilities.
+    """
+    resolved_data_dir = (data_dir or artifacts_dir.parent).resolve()
+    intel_store = get_intelligence_store(resolved_data_dir)
+
+    used_ensemble = False
+    h_id, a_id = None, None
+    canon_h, canon_a = home_name, away_name
+
+    try:
+        if is_neutral:
+            r1 = predict_match(home_name, away_name, artifacts_dir, is_neutral=True, match_date=match_date)
+            r2 = predict_match(away_name, home_name, artifacts_dir, is_neutral=True, match_date=match_date)
+            p_win = ((r1["probabilities"]["home_win"] + r2["probabilities"]["away_win"]) / 200.0)
+            p_draw = ((r1["probabilities"]["draw"] + r2["probabilities"]["draw"]) / 200.0)
+            p_loss = ((r1["probabilities"]["away_win"] + r2["probabilities"]["home_win"]) / 200.0)
+            lam_h = (r1["expected_goals_home"] + r2["expected_goals_away"]) / 2.0
+            lam_a = (r1["expected_goals_away"] + r2["expected_goals_home"]) / 2.0
+            h_elo, a_elo = r1["home_elo"], r1["away_elo"]
+            h_id, a_id = r1["home_team_id"], r1["away_team_id"]
+            canon_h, canon_a = r1["home_team"], r1["away_team"]
+        else:
+            r1 = predict_match(home_name, away_name, artifacts_dir, is_neutral=False, match_date=match_date)
+            p_win = r1["probabilities"]["home_win"] / 100.0
+            p_draw = r1["probabilities"]["draw"] / 100.0
+            p_loss = r1["probabilities"]["away_win"] / 100.0
+            lam_h = r1["expected_goals_home"]
+            lam_a = r1["expected_goals_away"]
+            h_elo, a_elo = r1["home_elo"], r1["away_elo"]
+            h_id, a_id = r1["home_team_id"], r1["away_team_id"]
+            canon_h, canon_a = r1["home_team"], r1["away_team"]
+        used_ensemble = True
+    except Exception:
+        h_elo = float(elo_override_home or 1680.0)
+        a_elo = float(elo_override_away or 1680.0)
+        adv = 0.0 if is_neutral else 60.0
+        diff = (h_elo - a_elo) + adv
+        lam_h = float(np.clip(1.35 + (diff / 500.0), 0.25, 4.2))
+        lam_a = float(np.clip(1.15 - (diff / 500.0), 0.25, 4.2))
+        p_win, p_draw, p_loss = calculate_dixon_coles_probs(lam_h, lam_a)
+
+    # Historical dossiers when team IDs exist
+    home_timing = intel_store.get_goal_timing_and_cards(h_id) if h_id is not None else intel_store.get_goal_timing_and_cards(-1)
+    away_timing = intel_store.get_goal_timing_and_cards(a_id) if a_id is not None else intel_store.get_goal_timing_and_cards(-1)
+
+    score_mat = build_calibrated_score_matrix(
+        lambda_h=lam_h,
+        lambda_a=lam_a,
+        target_probs=(p_win, p_draw, p_loss) if used_ensemble else None,
+        minute=minute,
+        current_hg=current_hg,
+        current_ag=current_ag,
+        red_cards_h=red_cards_h,
+        red_cards_a=red_cards_a,
+        momentum_shift=momentum_shift,
+    )
+
+    markets = compute_full_match_markets(
+        score_matrix=score_mat,
+        lambda_home=lam_h,
+        lambda_away=lam_a,
+        minute=minute,
+        current_hg=current_hg,
+        current_ag=current_ag,
+        expected_cards_home=home_timing["avg_yellow_cards"],
+        expected_cards_away=away_timing["avg_yellow_cards"],
+    )
+
+    dossier = {
+        "home_profile": intel_store.get_club_profile(h_id, canon_h) if h_id is not None else {"name": canon_h},
+        "away_profile": intel_store.get_club_profile(a_id, canon_a) if a_id is not None else {"name": canon_a},
+        "h2h": intel_store.get_head_to_head(h_id, a_id) if (h_id is not None and a_id is not None) else {"total_matches": 0, "matches": []},
+        "home_overall_form": intel_store.get_team_recent_form(h_id, n=10) if h_id is not None else {"matches": [], "form_sequence": []},
+        "away_overall_form": intel_store.get_team_recent_form(a_id, n=10) if a_id is not None else {"matches": [], "form_sequence": []},
+        "home_venue_form": intel_store.get_team_recent_form(h_id, n=5, venue_filter="home") if h_id is not None else {"matches": [], "form_sequence": []},
+        "away_venue_form": intel_store.get_team_recent_form(a_id, n=5, venue_filter="away") if a_id is not None else {"matches": [], "form_sequence": []},
+        "home_goal_timing": home_timing,
+        "away_goal_timing": away_timing,
+        "home_key_players": intel_store.get_key_players(h_id, team_expected_goals=lam_h) if h_id is not None else [],
+        "away_key_players": intel_store.get_key_players(a_id, team_expected_goals=lam_a) if a_id is not None else [],
+    }
+
+    return {
+        "home_team": canon_h,
+        "away_team": canon_a,
+        "home_team_id": h_id,
+        "away_team_id": a_id,
+        "is_neutral": is_neutral,
+        "in_play_state": {
+            "is_live": minute > 0,
+            "minute": minute,
+            "current_home_goals": current_hg,
+            "current_away_goals": current_ag,
+            "red_cards_home": red_cards_h,
+            "red_cards_away": red_cards_a,
+        },
+        "engine_mode": "192-feature-ml-ensemble" if used_ensemble else "dixon-coles-elo",
+        "elo": {
+            "home": round(h_elo, 1),
+            "away": round(a_elo, 1),
+            "diff": round(h_elo - a_elo, 1),
+        },
+        "expected_goals": {
+            "prematch_home": round(lam_h, 2),
+            "prematch_away": round(lam_a, 2),
+            "total": round(lam_h + lam_a, 2),
+        },
+        "markets": markets,
+        "historical_dossier": dossier,
+    }
+
+
+def get_league_intelligence(comp_code: str, artifacts_dir: Path, data_dir: Path | None = None) -> dict:
+    """Return full Top-5 European league intelligence (club Elos, valuations, goal rates, top scorers)."""
+    resolved_data_dir = (data_dir or artifacts_dir.parent).resolve()
+    intel_store = get_intelligence_store(resolved_data_dir)
+    elo_dict = {}
+    try:
+        _, _, _, meta = _load_cached_bundle(artifacts_dir)
+        elo_dict = meta.get("elo_dict", {})
+    except Exception:
+        pass
+    return intel_store.get_top5_league_summary(comp_code, elo_dict=elo_dict)
 
 
 def print_prediction_card(res: dict):
@@ -466,8 +633,9 @@ def run_batch_simulation(
 
 def main():
     parser = argparse.ArgumentParser(description="World Cup 2026 Predictive Engine & Betting Odds")
-    parser.add_argument("--mode", choices=["train", "test_wc26", "predict", "simulate"], default="test_wc26",
-                        help="Operation mode: train model, evaluate on WC26, predict match, or simulate batch")
+    parser.add_argument("--mode", choices=["train", "test_wc26", "predict", "deep", "league", "simulate"], default="test_wc26",
+                        help="Operation mode: train, test_wc26, predict, deep match analysis, league summary, or simulate")
+    parser.add_argument("--league-code", type=str, default="GB1", help="League code for league mode (GB1, ES1, L1, IT1, FR1)")
     parser.add_argument("--data-dir", type=str, default=".", help="Path to CSV datasets")
     parser.add_argument("--artifacts-dir", "--output-dir", dest="artifacts_dir", type=str, default="artifacts", help="Path to model artifacts")
     parser.add_argument("--force-rebuild", action="store_true", help="Force rebuilding feature cache from CSVs")
@@ -519,6 +687,16 @@ def main():
         away = args.away or input("Enter Away team name: ").strip()
         res = predict_match(home, away, artifacts_dir, is_neutral=args.neutral)
         print_prediction_card(res)
+
+    elif args.mode == "deep":
+        home = args.home or "Real Madrid"
+        away = args.away or "Liverpool"
+        res = analyze_match_deep(home, away, artifacts_dir, data_dir=data_dir, is_neutral=False)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+
+    elif args.mode == "league":
+        res = get_league_intelligence(args.league_code, artifacts_dir, data_dir=data_dir)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
 
     elif args.mode == "simulate":
         input_path = Path(args.input).resolve()

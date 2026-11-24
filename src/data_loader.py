@@ -138,28 +138,69 @@ def normalize_team_dim(
     return team_dim.drop_duplicates(subset=["team_id"]).reset_index(drop=True)
 
 
+_CLUB_STOP_TOKENS = {
+    "fc", "cf", "sc", "ac", "afc", "ssc", "bc", "ud", "rcd", "cd", "sv",
+    "vfb", "vfl", "tsg", "losc", "ogc", "rc", "aj", "as", "us", "ss", "fk",
+    "sl", "kv", "jk", "sco", "hsc", "cfc", "calcio", "football", "club",
+    "sportiva", "associazione", "societa", "balompie", "1899", "1909",
+    "1913", "1846", "1907", "1919", "04", "05", "29", "98", "63", "1.",
+}
+
+
+def _strip_club_tokens(norm_str: str) -> str:
+    cleaned = norm_str.replace(".", " ")
+    tokens = [t for t in cleaned.split() if t not in _CLUB_STOP_TOKENS]
+    return " ".join(tokens)
+
+
 def resolve_team_id(team_dim: pd.DataFrame, team_name: str) -> float:
-    """Resolve a team name to its canonical team_id, using alias mapping and fallbacks."""
+    """Resolve a club or national team name to its canonical team_id using multi-tier matching."""
     if not team_name:
         return float("nan")
+    raw_norm = normalize_name(team_name)
     norm = alias_team_name(team_name)
-    
-    # 1. Match against normalized team_name
+    norm_alias_norm = normalize_name(norm)
+
     dim_norm = team_dim["team_name"].fillna("").map(normalize_name)
-    matches = team_dim[dim_norm.eq(norm)]
-    if not matches.empty:
-        return float(matches.iloc[0]["team_id"])
-    
-    # 2. Match against team_country_name
-    country_norm = team_dim["team_country_name"].fillna("").map(normalize_name)
-    matches_c = team_dim[country_norm.eq(norm)]
+
+    # 1. Exact match against normalized team_name (or aliased normalized name)
+    for target in (norm_alias_norm, raw_norm):
+        matches = team_dim[dim_norm.eq(target)]
+        if not matches.empty:
+            return float(matches.iloc[0]["team_id"])
+
+    # 2. Check hardcoded known national team IDs (for exact country names)
+    for target in (norm_alias_norm, raw_norm):
+        if target in KNOWN_NATIONAL_TEAM_IDS:
+            return float(KNOWN_NATIONAL_TEAM_IDS[target])
+
+    # 3. Match against team_country_name ONLY for national_team entries
+    if "team_kind" in team_dim.columns:
+        nat_sub = team_dim[team_dim["team_kind"].eq("national_team")]
+    else:
+        nat_sub = team_dim
+    country_norm = nat_sub["team_country_name"].fillna("").map(normalize_name)
+    matches_c = nat_sub[country_norm.eq(norm_alias_norm)]
     if not matches_c.empty:
         return float(matches_c.iloc[0]["team_id"])
-    
-    # 3. Check hardcoded known national team IDs
-    if norm in KNOWN_NATIONAL_TEAM_IDS:
-        return float(KNOWN_NATIONAL_TEAM_IDS[norm])
-        
+
+    # 4. Club core-token stripped match (e.g. 'Liverpool' -> 'Liverpool FC', 'Bologna' -> 'Bologna Football Club 1909')
+    stripped_query = _strip_club_tokens(norm_alias_norm)
+    if stripped_query:
+        dim_stripped = dim_norm.map(_strip_club_tokens)
+        matches_s = team_dim[dim_stripped.eq(stripped_query)]
+        if not matches_s.empty:
+            clubs_first = matches_s[matches_s["team_kind"].eq("club")] if "team_kind" in matches_s.columns else matches_s
+            chosen = clubs_first if not clubs_first.empty else matches_s
+            return float(chosen.iloc[0]["team_id"])
+
+        # 5. Substring token containment fallback for multi-word club names
+        contains_m = team_dim[dim_stripped.str.contains(rf"\b{stripped_query}\b", regex=True, na=False)]
+        if not contains_m.empty:
+            clubs_first = contains_m[contains_m["team_kind"].eq("club")] if "team_kind" in contains_m.columns else contains_m
+            chosen = clubs_first if not clubs_first.empty else contains_m
+            return float(chosen.iloc[0]["team_id"])
+
     return float("nan")
 
 
